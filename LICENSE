@@ -1,0 +1,6 @@
+This is a Linux kernel out-of-tree module and is licensed GPL-2.0, consistent
+with the mainline Rockchip `rkvdec` driver it derives from and builds upon.
+
+The individual source files carry SPDX-License-Identifier headers. When
+extracting this directory to a standalone repository, include the full
+GPL-2.0 licence text (LICENSES/preferred/GPL-2.0 in the Linux tree) here.

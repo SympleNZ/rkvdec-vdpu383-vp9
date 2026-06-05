@@ -1,0 +1,3 @@
+# Kernel source: enforce LF everywhere so checkouts on any OS stay clean.
+* text=auto eol=lf
+*.csv text eol=lf

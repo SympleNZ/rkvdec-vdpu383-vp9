@@ -1,0 +1,178 @@
+# The VP9 compound-prediction bug (VDPU383, mainline-V4L2 stack)
+
+This is the one outstanding correctness bug and the reason this repo is published
+downstream-first. It is a **hardware-execution-level** difference between the
+mainline-kernel V4L2 stateless stack and the vendor MPP/BSP stack on the **same
+VDPU383 silicon** — not a value any driver programs. We have triaged it
+exhaustively at the register level; the remaining answer needs the hardware
+documentation.
+
+## 1. Symptom — precise
+
+For VP9 frames coded with **`reference_mode = 2` (SELECT / compound)**, the
+decode output is a **verbatim copy of the alt-ref reference frame**. Equivalent
+to decoding every block as `skip, single-ref = ALT, MV = 0, residual = 0`:
+
+- The **compound average** (½·last + ½·alt) is not applied.
+- The **coefficient residual** is not applied.
+- Output is purely the alt reference — not `last`, not `average(last, alt)`.
+
+It is **payload-dependent**, not uniformly "all compound frames wrong":
+
+- Small-payload, prediction-heavy compound frames (mostly skip blocks) →
+  collapse wholesale to the alt-ref copy.
+- Large-payload compound frames (lots of explicit residual coding) → decode
+  **correctly**.
+
+So the compound *average + residual* path is silently inert for blocks that rely
+on prediction; frames with enough explicit data mask it.
+
+### On-screen / real-content manifestation
+
+Real VP9 (YouTube-style, Big Buck Bunny, etc.) is compound-heavy and corrupts
+visibly. Measured on three real clips (per-frame `reference_mode` trace):
+
+| clip | compound (rm=2) frames | single-ref frames | HDMI result |
+|---|---|---|---|
+| earth_1080p_horizontal | 0 | 192 | perfect |
+| GoPro promo (why-hero) | 0 | 712 | perfect |
+| Big Buck Bunny Surround | **556** | 145 | gross corruption |
+
+Every clip that is compound-free is perfect; the only one that corrupts is 79%
+compound. This is the bug, end to end.
+
+## 2. Reproducer
+
+A minimal 3-frame `.ivf`: `KEY + hidden alt-ref (F1, show_frame=0) + shown
+compound frame (F2, reference_mode=2)`.
+
+- libvpx / MPP: `[KEY, correct-compound-F2]` (`F2 md5 cfe88b3a13`).
+- This driver: `[KEY, copy-of-F1]` — **F2 is byte-identical to the alt-ref F1**
+  (`md5 a5eb2e9b60`).
+
+(For a YouTube superframe the alt-ref is hidden inside the superframe; split it
+into its own packet to observe F1's pixels. The bug is intrinsic to F2's compound
+decode, not superframe packaging — a standalone 3-frame stream reproduces it.)
+
+## 3. What has been ruled out
+
+Every item below was an explicit experiment. The board is the same VDPU383
+silicon throughout; MPP is the ground-truth reference (it decodes the same
+streams correctly on the BSP stack).
+
+### Every programmable input is byte-identical to MPP
+
+For the failing compound frame, captured against MPP `DUMP_VDPU383_DATAS` dumps:
+
+- **Full register descriptor** — ctrl_regs (8–30), comm_paras (64–106: all
+  decode-control params incl. ref strides 83–91, dims, scaling, tile,
+  strm_start_bit), and the address registers (differ only in IOVA encoding,
+  semantically correct). 0 diffs.
+- **GBL header** (352 B) — byte-identical.
+- **Probability tables** — `prob_default` and the adapted `prob_loop[ctx]` the
+  HW reads for the compound frame: byte-identical (0/4864 differ).
+- **Both reference buffers** — `last`(KEY) and `alt`(F1) proven correct
+  independently (F1 decodes byte-identical to libvpx as a standalone frame).
+- No register exists in MPP's descriptor that this driver does not also set;
+  `reg_version`, `statistic_regs`, and the reg162–167 gap are all zero in both.
+
+### Cross-frame / stream-level state is replicated
+
+MPP's parser + HAL cross-frame records (`ls_info`, `use_prev_frame_mvs`,
+`frame_context_idx`, `prob_ctx_valid`, `pre_mv_base_addr`) were enumerated and
+checked. `use_prev_frame_mvs` is computed identically and the cumulative effect
+is proven by the **byte-identical GBL** (which encodes it). No missed function
+call, no un-replicated record.
+
+### Firmware — ruled out
+
+Ran this V4L2 driver on the BSP's **BL31 v1.17** (vs Armbian's v1.20) by
+repacking u-boot. Compound still collapses. MPP works on the same BL31 v1.17.
+So the difference is the software stack above BL31, not the firmware.
+
+### Decoder cache — ruled out
+
+MPP's live MMIO trace shows it programs the cache regs (CACHE0/1/2) only on the
+first task of a session. Tested this driver with per-frame cache clear (one
+cache, all three) and skip-all: no change in any configuration.
+
+### Clocks — ruled out
+
+`clk_summary` identical on both stacks (rkvdec_core 594 MHz, hclk 198 MHz,
+hevc_cabac 1 GHz, aclk_root 594/500 MHz).
+
+### Register write order — ruled out
+
+Forced the exact upstream HEVC burst order (COMMON, COMMON_ADDR, CODEC_PARAMS,
+CODEC_ADDR). No change. The HW latches on the kick (`CMD_SEND` for MPP); there is
+no per-register ordering MPP does that we miss. MPP's only "extra" step is the
+RCB SRAM info ioctl, and RCB is fully understood and ruled out (our allocation is
+≥ MPP's, in SRAM, and single-ref INTER decodes byte-perfect with it).
+
+### Completion is clean — not a silent/error path
+
+The failing compound frame finishes with a **clean DEC_RDY IRQ** (`sta=0x01`),
+no error bits, no soft-reset, and all references resolve (`ref_lookup_fallback=0`).
+The HW reports full success, yet emits the alt-ref copy. Link mode (continuous)
+also fails identically.
+
+### The two-reference averaging hardware path is sound (key triangulation)
+
+HEVC **B-frame bi-prediction** — the H.265 analogue of VP9 compound (average two
+references) — is **byte-exact** on this exact V4L2 stack (32-frame x265 stream,
+22 B-frames, 0 wrong). So:
+
+- The hardware's two-reference *averaging unit* works.
+- HEVC decode (the validated production path) is fully correct on this
+  kernel/IOMMU/m2m infrastructure.
+- Therefore the bug is **VP9-compound-specific**: compound frames are being
+  decoded as **single-ref (alt only)** — the per-block compound mode/reference
+  *selection* collapses, not the prediction arithmetic.
+
+### Decisive proof — the non-alt references are never read
+
+Gated experiment (`vp9_perturb_refs`): for the shown compound frame only,
+redirect the **`last` + `golden`** reference legs (header reg170/171 + payload
+reg195/196) to a 3 MB scratch buffer filled with `0x00`, leaving **`alt`**
+(reg172/197) intact. Decode the repro with the param off, then on, and diff.
+
+**Result: 0 / 1382400 bytes differ.** Zeroing both non-alt legs has **zero
+effect** on the output. The `last` and `golden` references are **never read**
+during the compound frame's decode — it depends only on `alt`.
+
+This confirms the per-block reference modes are all single-ref-from-alt (H1) and
+rules out a reference-pair/address/setup bug on our side (that would have
+darkened the output). The reference *setup* is correct; the references are
+correctly unused *because the decoded modes are single-ref-alt*. There is no
+address we can fix.
+
+## 4. Where it must be / the ask
+
+`reference_mode` is **never programmed to a register or the GBL by either
+driver** — the VDPU383 derives it purely from its own compressed-header bitstream
+decode (as the VP9 spec mandates). So there is no "enable compound" register we
+are failing to set.
+
+Given **byte-identical compressed-header bytes + probability tables (incl.
+`comp_mode` / `comp_ref`) that MPP decodes as compound**, the VDPU383 under the
+mainline-V4L2 driver silently downgrades the SELECT-mode frame's per-block
+reference modes to single-ref-from-alt. Same silicon, same input bytes, different
+decode. The only remaining variable is the **hardware's internal
+entropy-decoder / cross-frame context state at the moment it parses the compound
+frame** — below the MMIO register interface.
+
+**The question for the hardware owners:** what does MPP's device/session
+initialisation do — once, outside the per-frame register programming — that
+makes the VDPU383 engage VP9 compound (SELECT) prediction, which a mainline V4L2
+m2m client does not?
+
+## 5. Reproduce it yourself
+
+1. Build + load the module (see `BUILD_AND_TEST.md`).
+2. Decode any compound-heavy clip (e.g. Big Buck Bunny "Surround") to HDMI and
+   observe corruption; decode a compound-free clip and observe correctness.
+3. For the byte-level repro, build a 3-frame `KEY + hidden-alt-ref + compound`
+   `.ivf` and compare the second output frame to (a) the alt-ref decoded
+   standalone and (b) the libvpx reference. Ours matches (a); libvpx is (b).
+4. `vp9_perturb_refs=1` then decode the repro: output is unchanged → non-alt legs
+   unread.
