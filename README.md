@@ -11,9 +11,7 @@ repo is published downstream-first: working code plus a precise, fully-triaged
 question for the people with the hardware documentation (Collabora / the
 VDPU383 maintainers). See [The compound-prediction bug](#the-compound-prediction-bug-the-open-question).
 
-> Status as of 2026-06-05. Developed for the CastFlow wireless-classroom-display
-> project (Symple Solutions, NZ) as the high-resolution VP9 hardware-decode path
-> for the RK3576 endpoint.
+> Status as of 2026-06-05. Independent development on the RK3576 VDPU383.
 
 ---
 
@@ -242,6 +240,5 @@ register-level triage.
 ## Publishing note
 
 This directory is a self-contained snapshot intended to become a standalone
-public repository (`git init` here and push). It is checked into the CastFlow
-working tree under `docs/rk3576/vp9/release/` for staging. Nothing here is
-auto-published.
+public repository (`git init` here and push). It is staged in a development
+tree for snapshotting. Nothing here is auto-published.

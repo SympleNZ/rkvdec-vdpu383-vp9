@@ -43,7 +43,7 @@ v4l2slvp9dec ! fakesink sync=false`, performance governor unless noted.
   dip (ondemand's first run is ~210 fps then settles ~288; performance is a flat
   324–326). The driver's per-frame CPU glue is mildly freq-sensitive.
 
-## Result 2 — realtime at the resolutions CastFlow cares about
+## Result 2 — realtime at the target resolutions
 
 via-gst (frame goes through the gst pipeline) vs **pure HW decode time**
 (kick→DONE IRQ, `vp9_time` module-param instrumentation; isolates the decoder
@@ -110,7 +110,7 @@ appears.)
   was chasing that phantom (and was correctly abandoned).
 - **One free, safe win (userspace, not driver):** run the CPU at `performance`
   (or a cpufreq floor) during decode for +21% and no cold-start dip. Belongs in
-  the CastFlow endpoint / a systemd-or-udev rule, not the driver — a driver
+  userspace / a systemd-or-udev rule, not the driver — a driver
   shouldn't hijack the system governor.
 
 Clean probe streams left on `.165`: `/root/clean720.ivf`, `clean1080.ivf`,
