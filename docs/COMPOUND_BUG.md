@@ -146,6 +146,17 @@ darkened the output). The reference *setup* is correct; the references are
 correctly unused *because the decoded modes are single-ref-alt*. There is no
 address we can fix.
 
+
+### RCB placement (SRAM vs DRAM) — ruled out
+
+The Rockchip BSP kernel rewrites the RCB base registers in-kernel at submit
+(`mpp_set_rcbbuf`) and, with no `rcb-iova` in the BSP DT, decodes with **DRAM** RCB;
+the mainline V4L2 driver always uses **SRAM** RCB — a divergence invisible to the HAL
+register dump. Forcing all-DRAM RCB and re-decoding a compound-heavy clip (`sintel`,
+1280×546, 789 frames) gives **487/789 frames wrong under both SRAM and DRAM — a
+byte-identical outcome.** RCB placement does not affect the compound collapse. (It *does*
+move AV1's separate intra-above-row bug, so it was worth excluding here.)
+
 ## 4. Where it must be / the ask
 
 `reference_mode` is **never programmed to a register or the GBL by either
