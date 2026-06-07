@@ -157,6 +157,28 @@ register dump. Forcing all-DRAM RCB and re-decoding a compound-heavy clip (`sint
 byte-identical outcome.** RCB placement does not affect the compound collapse. (It *does*
 move AV1's separate intra-above-row bug, so it was worth excluding here.)
 
+### Power state, warm-up, and session continuity — ruled out (2026-06-08)
+
+The natural reading of "MPP keeps the session continuous, our single-shot tears
+it down per frame" was tested directly and refuted **three ways** on the
+byte-level repro:
+
+- **Runtime-PM power domain forced on** (`/sys/bus/platform/devices/<dev>/power/control
+  = on`) so the decoder never suspends between frames — no change.
+- **Per-resume HW warm-up disabled** — no change.
+- **Truly continuous link runtime** (`rkvdec_link_mode=1` + `rkvdec_submit_mode=2`
+  + `rkvdec_link_depth=2`): the two repro frames batched into a **single** link
+  submission so the HW is never idled or re-programmed between them — still the
+  identical alt-ref copy (`a5eb2e9b60…` vs the correct `cfe88b3a13…`).
+
+MPP does run the whole stream as one continuous link session (cache/link
+programmed once on the first task, HW kept live frame-to-frame), versus our
+per-frame `memset`+reprogram. But the three tests above show that difference is
+**non-causal**: the compound collapse is byte-identical whether the HW is
+power-cycled and fully re-initialised per frame, or kept continuously live across
+the GOP. So it is **not** power state, **not** the warm-up, and **not**
+session/runtime continuity.
+
 ## 4. Where it must be / the ask
 
 `reference_mode` is **never programmed to a register or the GBL by either
@@ -175,7 +197,12 @@ frame** — below the MMIO register interface.
 **The question for the hardware owners:** what does MPP's device/session
 initialisation do — once, outside the per-frame register programming — that
 makes the VDPU383 engage VP9 compound (SELECT) prediction, which a mainline V4L2
-m2m client does not?
+m2m client does not? Note the obvious candidate is already excluded (§3): it is
+**not** session/runtime *continuity* — power-cycling and fully re-initialising the
+HW every frame vs keeping it continuously live across the GOP gives byte-identical
+wrong output. So the missing piece is some other per-session device-init state the
+HW carries into its compressed-header entropy decode, not the fact of a persistent
+session.
 
 ## 5. Reproduce it yourself
 

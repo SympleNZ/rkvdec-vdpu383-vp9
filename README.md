@@ -11,7 +11,7 @@ repo is published downstream-first: working code plus a precise, fully-triaged
 question for the people with the hardware documentation (Collabora / the
 VDPU383 maintainers). See [The compound-prediction bug](#the-compound-prediction-bug-the-open-question).
 
-> Status as of 2026-06-05. Independent development on the RK3576 VDPU383.
+> Status as of 2026-06-08. Independent development on the RK3576 VDPU383.
 
 ---
 
@@ -169,6 +169,21 @@ instead of the correct frame (`cfe88b3a13`).
   **by zero bytes** — proving the non-alt references are **never read**. The
   frame depends only on alt. Compound never engages; every block is decoded as
   single-ref-from-alt.
+- **Continuous-session / power / warm-state HW context (2026-06-08, decisive
+  negative):** the most natural remaining hypothesis — that compound needs
+  cross-frame HW state which MPP's *continuous* link session preserves and our
+  per-frame single-shot submit tears down — is **refuted three ways on the same
+  repro**: (1) forcing the decoder's runtime-PM power domain to stay on (no
+  per-frame suspend, so no power-cycle between frames), (2) disabling the
+  per-resume HW warm-up, and (3) running the repro through a *truly continuous*
+  link runtime (the two repro frames batched into **one** link submission so the
+  HW is never idled between them) — **all three produce the identical alt-ref
+  copy.** For reference, MPP *does* run the whole stream as one continuous link
+  session (cache/link configured once on the first task, HW kept live
+  frame-to-frame) versus our per-frame `memset`+reprogram — but that device-flow
+  difference is **non-causal** for this bug. So it is not power state, not the
+  warm-up, and not session/runtime continuity: same input, same completion, same
+  wrong output whether the HW is reset between frames or kept continuously live.
 
 ### The ask
 
