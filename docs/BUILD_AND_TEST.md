@@ -83,7 +83,7 @@ turn a clean run into a timeout-laden one. Throughput in particular swings wildl
 |---|---|
 | `vp9_skip_tlb_flush` | IOMMU TLB-flush policy: `0` flush-only-after-restore (default, the throughput fix), `1` never (debug), `2` always per-frame (old behaviour / A-B baseline) |
 | `vp9_time` | print mean pure-HW decode time (kick→DONE IRQ) every 100 frames |
-| `rkvdec_link_mode` | `0` single-shot submit (default), `1` link/batched submit |
+| `rkvdec_link_mode` | `0` single-shot submit (default), `1` link/batched submit (experimental — does not improve throughput on RK3576's single decode core, and currently fails on compound content) |
 | `vp9_perturb_refs` | diagnostic: redirect a compound frame's non-alt reference legs to a scratch buffer (used to prove compound never engages — see COMPOUND_BUG.md) |
 | `vp9_dump_ctrls` | dump each frame's `v4l2_ctrl_vp9_frame` as one hex line |
 

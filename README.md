@@ -214,9 +214,12 @@ VDPU383 engage compound prediction?**
   frames on the stride transition. Downstream (gst), not a kernel decode bug.
 - **Profile 3 (4:2:2 / 4:4:4) and 12-bit** — unsupported by design (only 4:2:0
   8/10-bit declared).
-- **Throughput vs the vendor stack** — MPP/BSP is ~2.3–3× faster (it pipelines
-  via link mode; this driver uses per-frame single-shot submit). Still multiples
-  of real-time at 720p/1080p. See [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md).
+- **Throughput vs the vendor stack** — MPP/BSP is ~2.3–3× faster; the residual
+  gap is the **per-frame HW decode time** (memory-bandwidth-bound), not
+  inter-frame submission — RK3576 is single-core, so pipelining can't overlap
+  decode (reg13 / cache / clocks / FBC ruled out; flush-only-after-restore is the
+  landed win). Still multiples of real-time at 720p/1080p. See
+  [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md).
 
 ---
 
