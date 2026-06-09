@@ -184,6 +184,14 @@ instead of the correct frame (`cfe88b3a13`).
   difference is **non-causal** for this bug. So it is not power state, not the
   warm-up, and not session/runtime continuity: same input, same completion, same
   wrong output whether the HW is reset between frames or kept continuously live.
+- **Decode-side, not execution — and the decision prob matches MPP (2026-06-08):** the
+  failing frame's HW-adapted `comp_mode`/`comp_ref` probs come back **unchanged** (zero
+  compound decisions counted) while `single_ref` adapts — so the HW decodes **every block as
+  single-reference**, it never decodes compound at all (not "decoded compound but
+  mis-averaged"). And our **`comp_mode` input prob is byte-identical to MPP** (cross-dumped),
+  with HW forward-updates applied correctly and the post-KEY context at correct non-zero
+  defaults. Same decision prob as MPP, yet single-ref decode → the per-block compound/single
+  choice diverges below MMIO. See [`docs/COMPOUND_BUG.md` §3b](docs/COMPOUND_BUG.md).
 
 ### The ask
 

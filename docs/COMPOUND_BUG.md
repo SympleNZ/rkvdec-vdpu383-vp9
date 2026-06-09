@@ -179,6 +179,41 @@ power-cycled and fully re-initialised per frame, or kept continuously live acros
 the GOP. So it is **not** power state, **not** the warm-up, and **not**
 session/runtime continuity.
 
+## 3b. Update 2026-06-08 — it is decode-side: HW decodes single-reference, never compound
+
+Dumping the HW-adapted probability buffer (`probs[frame_context_idx]`, the post-decode
+backward-adaptation writeback) for the failing compound frame pins the mechanism more
+precisely than "collapses to an alt copy":
+
+- After the compound frame decodes, the adapted **`comp_mode` and `comp_ref` probs are
+  unchanged** from the context input, while **`single_ref` *does* adapt**. Because the
+  adaptation path is demonstrably alive (single_ref moved), `comp_mode`/`comp_ref` staying
+  flat means the HW counted **zero compound-mode decisions** — i.e. it decoded **every block
+  as single-reference**. So this is **not** "decoded compound but mis-executed the average"
+  (that would have moved `comp_mode`); the HW **never decodes compound at all** — it
+  mis-resolves the per-block compound/single choice as always-single under
+  `reference_mode = SELECT`. (Coherent with the alt-only reference reads in §3 and the clean
+  alt-*copy* output: a copy is what single-ref/skip produces, not garbled compound execution.)
+
+- **The `comp_mode` decision prob we feed HW is byte-identical to MPP.** Cross-dumped MPP's
+  input prob buffer for the same frame on the BSP (`cabac_update_probe.dat`, text-hex,
+  byte-reversed per 16-byte line): `comp_mode` and `comp_ref` match ours exactly. The
+  *non-degenerate* default comp_mode probs are in place (the post-KEY context is reset to
+  spec defaults, not left zero — a separate desync that is already fixed), so HW *should*
+  sometimes pick compound; it never does.
+
+- **HW forward-updates correctly.** MPP pre-applies the compressed-header forward prob
+  updates and feeds the result; we feed the saved context and the VDPU383 applies the forward
+  updates itself (our post-decode adapted buffer equals MPP's forward-updated values, and
+  single-ref content like BBB is byte-perfect). So the forward-update division of labour is
+  not the divergence either.
+
+Net: identical `comp_mode` input, correct forward-update handling, correct (non-zero) default
+probs — **yet the HW resolves every block to single-reference**. The per-block compound/single
+decision diverges **below the MMIO interface**, established far deeper than "the registers
+match": the specific decision probability is byte-identical and the entropy/forward-update
+path is correct.
+
 ## 4. Where it must be / the ask
 
 `reference_mode` is **never programmed to a register or the GBL by either
