@@ -129,7 +129,7 @@ references) — is **byte-exact** on this exact V4L2 stack (32-frame x265 stream
   decoded as **single-ref (alt only)** — the per-block compound mode/reference
   *selection* collapses, not the prediction arithmetic.
 
-### Decisive proof — the non-alt references are never read
+### The non-alt references have no effect on the output (refined in §6.2)
 
 Gated experiment (`vp9_perturb_refs`): for the shown compound frame only,
 redirect the **`last` + `golden`** reference legs (header reg170/171 + payload
@@ -137,14 +137,20 @@ reg195/196) to a 3 MB scratch buffer filled with `0x00`, leaving **`alt`**
 (reg172/197) intact. Decode the repro with the param off, then on, and diff.
 
 **Result: 0 / 1382400 bytes differ.** Zeroing both non-alt legs has **zero
-effect** on the output. The `last` and `golden` references are **never read**
-during the compound frame's decode — it depends only on `alt`.
+effect** on the output — the result depends only on `alt`.
 
-This confirms the per-block reference modes are all single-ref-from-alt (H1) and
-rules out a reference-pair/address/setup bug on our side (that would have
-darkened the output). The reference *setup* is correct; the references are
-correctly unused *because the decoded modes are single-ref-alt*. There is no
-address we can fix.
+> **Correction (2026-06-09, §6.2):** this was originally written as "the non-alt
+> references are *never read*." A later deterministic IOMMU access trace shows the
+> HW **does** issue pixel-fetch reads to `last` — so they are *fetched but have no
+> effect on output*, not skipped. (The zero-byte result was also measured on the
+> non-deterministic displayed output, which is why the IOMMU trace is the reliable
+> signal here.) The conclusion below — references *correctly unused because the
+> decoded modes are single-ref* — is unchanged; only "never read" was too strong.
+
+This confirms the per-block reference modes resolve single-ref and rules out a
+reference-pair/address/setup bug on our side (that would have darkened the
+output). The reference *setup* is correct; the references are unused *because the
+decoded modes are single-ref* (see §3b). There is no address we can fix.
 
 
 ### RCB placement (SRAM vs DRAM) — ruled out
@@ -192,8 +198,9 @@ precisely than "collapses to an alt copy":
   as single-reference**. So this is **not** "decoded compound but mis-executed the average"
   (that would have moved `comp_mode`); the HW **never decodes compound at all** — it
   mis-resolves the per-block compound/single choice as always-single under
-  `reference_mode = SELECT`. (Coherent with the alt-only reference reads in §3 and the clean
-  alt-*copy* output: a copy is what single-ref/skip produces, not garbled compound execution.)
+  `reference_mode = SELECT`. (Coherent with the clean alt-*copy* output: a copy is what
+  single-ref/skip produces, not garbled compound execution. Note the references *are* fetched
+  at the bus level — §6.2 — they just have no effect when no block decodes compound.)
 
 - **The `comp_mode` decision prob we feed HW is byte-identical to MPP.** Cross-dumped MPP's
   input prob buffer for the same frame on the BSP (`cabac_update_probe.dat`, text-hex,
@@ -254,7 +261,7 @@ session.
 
 ---
 
-## 6. Update 2026-06-09 — input equivalence fully closed; failure localised to the compound *combine*
+## 6. Update 2026-06-09 — input equivalence fully closed; references are fetched but no compound block is decoded
 
 Three further results, each with a deterministic signal (the displayed cascade is
 non-deterministic, but the first compound frame's HW-adapted prob state is stable
@@ -277,7 +284,7 @@ by any host/python CRC variant, so a CRC-vs-CRC comparison falsely reports a div
 byte-diff the raw buffers, or run the same CRC on both sides. This nearly produced a false
 "input differs" conclusion.) Input equivalence is now exhausted at the deepest level.
 
-### 6.2 IOMMU access trace — the HW *does* engage compound at the fetch level
+### 6.2 IOMMU access trace — the candidate references *are* fetched (correcting §3's "never read")
 Pointing the compound frame's `last`/`golden` reference-address registers at deliberately
 **unmapped IOVA sentinels** (distinct per leg+kind) and reading the `rk_iommu` page-fault
 address turns "does the HW read this leg?" into a deterministic yes/no:
@@ -289,13 +296,19 @@ golden— pixel  (reg171):   0
 golden— payload(reg196):   0     (alt is kept mapped, read normally)
 ```
 
-So for the SELECT frame the HW performs genuine **two-reference** prediction — it fetches
-`last` **and** `alt` (never `golden`). This **corrects** the earlier content-perturb reading
-("collapses to an alt-only copy / non-alt legs unread"): that test compared a
-non-deterministic displayed output; the deterministic bus trace shows the second leg *is*
-read. The failure is therefore **not** in reference selection or fetch — it is in the
-per-block compound **combine** (the averaging of the two predictions), one stage downstream,
-fed byte-identical inputs.
+So the HW *does* issue pixel-fetch reads to `last` (and `alt`; never `golden`). This
+**corrects** §3's "the non-alt references are never read": that was inferred from a
+*content* perturbation measured on the non-deterministic displayed output; the deterministic
+bus trace shows the references are **fetched** — they simply have no effect on the result.
+
+It does **not** mean compound engages. §3b is the authoritative signal: `comp_mode` never
+adapts, so the HW decodes **zero compound blocks**. So the references are set up, but the
+per-block compound/single *decision* always resolves to single-ref and the two-reference
+average is **never formed**. The divergence is that **decision** (the compressed-header /
+entropy-level handling of `reference_mode = SELECT`), which sits **upstream** of the
+averaging unit — and the averaging unit itself is proven sound (§3, HEVC bi-prediction is
+byte-exact). This rules out reference *fetch/selection* as the failure site, not the
+combine (which is never reached).
 
 ### 6.3 No compound-enable register bit exists (reserved-bit sweep)
 To rule out the one class an input-diff structurally cannot see — a control bit that matters
@@ -308,8 +321,10 @@ is bitstream-derived, not register-gated — there is no "enable compound" switc
 
 ### Net
 Every programmable input (registers, GBL, full entropy prob buffer) is byte-identical to the
-vendor stack; the HW fetches both compound references; no register bit gates the behaviour —
-yet every block resolves single-ref. The divergence is in the VDPU383's internal compound
-prediction/combine, **below the MMIO interface**. The §4 ask stands, now sharpened: the
-missing piece is whatever device/session state arms the compound *combine*, not reference
-fetch and not a settable control.
+vendor stack; the candidate references are fetched; no register bit gates the behaviour — yet
+every block resolves single-ref (`comp_mode` counts zero compound decisions). The divergence
+is the VDPU383's internal per-block compound/single **decision** under `reference_mode =
+SELECT` — upstream of the (proven-sound) averaging unit — **below the MMIO interface**. The §4
+ask stands, now sharpened: the missing piece is whatever device/session state lets the HW
+*decode* compound under SELECT, not reference fetch, not the averaging unit, and not a
+settable control.

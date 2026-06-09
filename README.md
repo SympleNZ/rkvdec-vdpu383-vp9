@@ -23,7 +23,7 @@ VDPU383 maintainers). See [The compound-prediction bug](#the-compound-prediction
 | 8-bit Profile 0 — single-ref INTER (≥128px) | ✅ byte-exact to libvpx; visually perfect on HDMI |
 | 10-bit Profile 2 (4:2:0) | ✅ correct (±1 reconstruction rounding); HDR10+ displays correctly |
 | Resolutions 720p / 1080p / 4K | ✅ all decode; well above real-time on clean content |
-| **VP9 compound / SELECT (alt-ref) prediction** | ❌ **the open bug** — collapses to an alt-ref copy |
+| **VP9 compound / SELECT (alt-ref) prediction** | ❌ **the open bug** — HW decodes single-ref only; compound never engages |
 | Small-dimension (<128px) single-ref INTER | ⚠️ conformance-only defect, zero real-world impact |
 | Mid-stream resize | ⚠️ driver signals it; gst-plugins-bad drops frames (downstream) |
 | Profile 3 (4:2:2 / 4:4:4), 12-bit | ❌ unsupported by design |
@@ -124,13 +124,17 @@ the `flush-only-after-restore` optimisation).
 **This is the centrepiece.** Full triage in
 [`docs/COMPOUND_BUG.md`](docs/COMPOUND_BUG.md); summary here.
 
-> **Latest (2026-06-09, [`COMPOUND_BUG.md` §6](docs/COMPOUND_BUG.md)):** the *complete*
-> 2432-byte entropy-input prob buffer (incl. the coef table) is now byte-identical to MPP
-> (0 diffs) — input equivalence fully exhausted. An IOMMU access trace shows the HW **does**
-> fetch both compound legs (`last` + `alt`), so compound *engages* at the fetch level and the
-> failure is in the per-block **combine**, downstream — this corrects the earlier "collapses to
-> an alt-only copy" reading. A reserved-register-bit sweep found **no** compound-enable bit
-> (compound is bitstream-derived, not register-gated).
+> **Latest (2026-06-09, [`COMPOUND_BUG.md` §6](docs/COMPOUND_BUG.md)):** three results that
+> tighten — but do not change — the conclusion. (1) Input equivalence is now *fully* closed: the
+> complete 2432-byte entropy-input prob buffer (incl. the coef table), not just the mode probs,
+> is byte-identical to MPP (0 diffs). (2) A deterministic IOMMU access trace shows the HW *does*
+> issue pixel-fetch reads to the `last` reference (never `golden`) — so the candidate references
+> are *fetched*; this **corrects** the earlier "non-alt references never read" inference (that was
+> read off a non-deterministic output). It does **not** mean compound works: `comp_mode` still
+> never adapts, so the HW decodes **zero compound blocks** — the divergence is the per-block
+> compound/single *decision*, upstream of the (proven-sound) averaging unit. (3) A
+> reserved-register-bit sweep finds **no** compound-enable bit — `reference_mode` is
+> bitstream-derived, not register-gated.
 
 ### Symptom
 
@@ -172,11 +176,15 @@ instead of the correct frame (`cfe88b3a13`).
   bi-prediction (the H.265 analogue of VP9 compound) is **byte-exact** on this
   exact V4L2 stack. So the averaging unit is not broken — VP9 compound is failing
   to *engage*, not failing to average.
-- **Reference-perturbation proof (decisive):** zeroing the `last` + `golden`
-  reference legs of the compound frame (leaving `alt` intact) changes the output
-  **by zero bytes** — proving the non-alt references are **never read**. The
-  frame depends only on alt. Compound never engages; every block is decoded as
-  single-ref-from-alt.
+- **Reference-perturbation (refined 2026-06-09):** zeroing the `last` + `golden`
+  reference *content* (leaving `alt`) changes the output **by zero bytes** — the
+  non-alt references have no effect on the result. *Correction:* this was first
+  read as "non-alt references never read", but a deterministic IOMMU access trace
+  (below) shows the HW *does* issue pixel-fetch reads to `last` — the references
+  are **fetched but have no effect on output**, not skipped. The "unchanged"
+  result was measured on the non-deterministic displayed output; the IOMMU trace
+  is the reliable signal. Either way compound never *engages*: every block decodes
+  single-ref (see the adapted-prob bullet).
 - **Continuous-session / power / warm-state HW context (2026-06-08, decisive
   negative):** the most natural remaining hypothesis — that compound needs
   cross-frame HW state which MPP's *continuous* link session preserves and our
@@ -200,6 +208,20 @@ instead of the correct frame (`cfe88b3a13`).
   with HW forward-updates applied correctly and the post-KEY context at correct non-zero
   defaults. Same decision prob as MPP, yet single-ref decode → the per-block compound/single
   choice diverges below MMIO. See [`docs/COMPOUND_BUG.md` §3b](docs/COMPOUND_BUG.md).
+- **Full entropy-input equivalence (2026-06-09):** beyond the `comp_mode`/`comp_ref` probs, the
+  **complete 2432-byte entropy-input prob buffer** (incl. the coef table, uv_mode, mv probs) is
+  **byte-identical to MPP's `cabac_last`** for the failing frame — 0 of 2432 bytes differ. The
+  last input that had not been fully byte-compared now matches exactly.
+- **IOMMU access trace (2026-06-09):** redirecting each reference leg to a distinct unmapped
+  IOVA and reading the fault address shows the HW issues **pixel-fetch reads to `last` and
+  `alt`** (never `golden`) for the SELECT frame — so the candidate references are set up at the
+  bus level. This is *not* evidence compound engages (it doesn't — `comp_mode` never adapts);
+  it corrects the perturbation bullet's "never read" and rules out reference *fetch/selection*
+  as the failure site.
+- **No compound-enable register (2026-06-09):** OR-sweeping the reserved bitfields of every
+  VDPU383 common control register on the failing frame changes the decode in **no** case — most
+  reserved bits are unimplemented, the writable few have no effect. There is no settable
+  "engage compound" bit (consistent with `reference_mode` being bitstream-derived).
 
 ### The ask
 
