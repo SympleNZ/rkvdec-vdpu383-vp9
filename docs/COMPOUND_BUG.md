@@ -247,5 +247,69 @@ session.
 3. For the byte-level repro, build a 3-frame `KEY + hidden-alt-ref + compound`
    `.ivf` and compare the second output frame to (a) the alt-ref decoded
    standalone and (b) the libvpx reference. Ours matches (a); libvpx is (b).
-4. `vp9_perturb_refs=1` then decode the repro: output is unchanged → non-alt legs
-   unread.
+4. `vp9_perturb_refs=1` then decode the repro: output is unchanged. *(See §6 —
+   the deterministic IOMMU trace supersedes this: the HW **does** fetch `last`;
+   the content-perturb's "unchanged" was an artefact of the non-deterministic
+   displayed output.)*
+
+---
+
+## 6. Update 2026-06-09 — input equivalence fully closed; failure localised to the compound *combine*
+
+Three further results, each with a deterministic signal (the displayed cascade is
+non-deterministic, but the first compound frame's HW-adapted prob state is stable
+run-to-run — `crc=6b381b36 comp_mode@116=ef b7 77 60 29`, identical over 3 runs — so it
+is a reliable readout).
+
+### 6.1 The *entire* entropy-input prob buffer is byte-identical to MPP
+Earlier comparisons matched the registers, the GBL, and the `comp_mode`/`comp_ref` mode
+probs. The one input never fully byte-compared was the **complete 2432-byte entropy-input
+prob buffer** (incl. the large coef table). Dumping `probs[frame_context_idx]` immediately
+before the kick for the compound frame and diffing against MPP's `cabac_last`:
+
+```
+ours vs MPP cabac_last:  0 byte differences of 2432
+```
+
+Partition probs, every mode prob, the full coef table, uv_mode and mv probs — **all
+identical**. (Caveat for anyone reproducing: the kernel's `crc32()` is **not** reproducible
+by any host/python CRC variant, so a CRC-vs-CRC comparison falsely reports a divergence;
+byte-diff the raw buffers, or run the same CRC on both sides. This nearly produced a false
+"input differs" conclusion.) Input equivalence is now exhausted at the deepest level.
+
+### 6.2 IOMMU access trace — the HW *does* engage compound at the fetch level
+Pointing the compound frame's `last`/`golden` reference-address registers at deliberately
+**unmapped IOVA sentinels** (distinct per leg+kind) and reading the `rk_iommu` page-fault
+address turns "does the HW read this leg?" into a deterministic yes/no:
+
+```
+last  — pixel  (reg170):  18 faults, row-strided  → HW issues motion-comp pixel reads from `last`
+last  — payload(reg195):   0
+golden— pixel  (reg171):   0
+golden— payload(reg196):   0     (alt is kept mapped, read normally)
+```
+
+So for the SELECT frame the HW performs genuine **two-reference** prediction — it fetches
+`last` **and** `alt` (never `golden`). This **corrects** the earlier content-perturb reading
+("collapses to an alt-only copy / non-alt legs unread"): that test compared a
+non-deterministic displayed output; the deterministic bus trace shows the second leg *is*
+read. The failure is therefore **not** in reference selection or fetch — it is in the
+per-block compound **combine** (the averaging of the two predictions), one stage downstream,
+fed byte-identical inputs.
+
+### 6.3 No compound-enable register bit exists (reserved-bit sweep)
+To rule out the one class an input-diff structurally cannot see — a control bit that matters
+but that MPP also never sets — we OR-swept the **reserved bitfields of every VDPU383 common
+control register** (reg009 `important_en` first, then reg010/011/012/016/022/023/024–026/027)
+into the live register on the compound frame, watching the adapted-prob signal. Result:
+**no bit changed the compound decode.** Most "reserved" bits are unimplemented (writes read
+back 0); the few writable ones have no effect. This empirically confirms §4: `reference_mode`
+is bitstream-derived, not register-gated — there is no "enable compound" switch to find.
+
+### Net
+Every programmable input (registers, GBL, full entropy prob buffer) is byte-identical to the
+vendor stack; the HW fetches both compound references; no register bit gates the behaviour —
+yet every block resolves single-ref. The divergence is in the VDPU383's internal compound
+prediction/combine, **below the MMIO interface**. The §4 ask stands, now sharpened: the
+missing piece is whatever device/session state arms the compound *combine*, not reference
+fetch and not a settable control.

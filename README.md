@@ -11,7 +11,7 @@ repo is published downstream-first: working code plus a precise, fully-triaged
 question for the people with the hardware documentation (Collabora / the
 VDPU383 maintainers). See [The compound-prediction bug](#the-compound-prediction-bug-the-open-question).
 
-> Status as of 2026-06-08. Independent development on the RK3576 VDPU383.
+> Status as of 2026-06-09. Independent development on the RK3576 VDPU383.
 
 ---
 
@@ -123,6 +123,14 @@ the `flush-only-after-restore` optimisation).
 
 **This is the centrepiece.** Full triage in
 [`docs/COMPOUND_BUG.md`](docs/COMPOUND_BUG.md); summary here.
+
+> **Latest (2026-06-09, [`COMPOUND_BUG.md` §6](docs/COMPOUND_BUG.md)):** the *complete*
+> 2432-byte entropy-input prob buffer (incl. the coef table) is now byte-identical to MPP
+> (0 diffs) — input equivalence fully exhausted. An IOMMU access trace shows the HW **does**
+> fetch both compound legs (`last` + `alt`), so compound *engages* at the fetch level and the
+> failure is in the per-block **combine**, downstream — this corrects the earlier "collapses to
+> an alt-only copy" reading. A reserved-register-bit sweep found **no** compound-enable bit
+> (compound is bitstream-derived, not register-gated).
 
 ### Symptom
 
