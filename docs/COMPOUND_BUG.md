@@ -7,6 +7,29 @@ VDPU383 silicon** — not a value any driver programs. We have triaged it
 exhaustively at the register level; the remaining answer needs the hardware
 documentation.
 
+## 0. Update 2026-06-10 — proven HW-internal; all software layers exhausted
+
+A deep follow-up closed the software-side investigation with on-hardware proof:
+
+- **Per-decode register read-back, correlated with outcome:** the control/parameter registers
+  are **byte-identical run-to-run** (a fixed CRC) regardless of whether the frame decodes
+  correctly. The register file we program is provably deterministic and is *not* the source.
+- **Software, not silicon:** the vendor MPP stack decodes the same compound clip **byte-identical
+  to libvpx** on the same SoC (luma md5 match); ours diverges on that frame. The silicon can do
+  it under the right software.
+- **All three software layers walked, all negative:** the HAL/register file (byte-identical), the
+  per-codec kernel driver (~20 levers — cache attribute/config, TLB flush, register-bit/mode
+  permutations incl. the BSP link-descriptor "error-mode flag" `WAIT_RESET_EN`, warmup, kick
+  barriers, write order, link mode, power-cycle, clocks), and the core MPP **service** layer
+  (`mpp_service`/`mpp_iommu`: full IOMMU hardware refresh `rockchip_iommu_disable+enable`
+  equivalent, and the cached-dma-buf buffer model). None move the result.
+
+**Conclusion:** the compound-arming difference leaves **no trace** in any register, buffer, IOMMU
+operation, or memory attribute reachable from a V4L2 driver. It is an internal VDPU383 state the
+vendor stack primes through normal operation. The sections below are the original register-level
+triage; this update supersedes the "we can't yet rule out X register" framing — it is now
+exhaustively ruled out across all three software layers.
+
 ## 1. Symptom — precise
 
 For VP9 frames coded with **`reference_mode = 2` (SELECT / compound)**, the

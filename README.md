@@ -11,7 +11,34 @@ repo is published downstream-first: working code plus a precise, fully-triaged
 question for the people with the hardware documentation (Collabora / the
 VDPU383 maintainers). See [The compound-prediction bug](#the-compound-prediction-bug-the-open-question).
 
-> Status as of 2026-06-09. Independent development on the RK3576 VDPU383.
+> Status as of 2026-06-10. Independent development on the RK3576 VDPU383.
+
+---
+
+## ★ Update 2026-06-10 — the compound bug is proven HW-internal (below everything software-reachable)
+
+A deep follow-up session **definitively localized** the compound bug and closed the
+register-level investigation:
+
+- **On-hardware proof it is NOT the register file.** Reading back the full HW register state
+  per-decode and correlating with the outcome shows the control/parameter registers are
+  **byte-identical run-to-run regardless of whether the frame decodes correctly or not.** Our
+  programming is provably deterministic and identical; the divergence is below it.
+- **Software, not silicon (confirmed byte-exact).** The vendor MPP stack decodes the same
+  compound clip **byte-identical to libvpx** on the same SoC (luma md5 match), while our V4L2
+  output diverges on exactly that frame. So the VDPU383 *can* decode it correctly under the
+  right software — the fix is reachable in principle, just not from the register/buffer surface.
+- **All three software layers walked, all negative.** (1) HAL / register file — byte-identical;
+  (2) the per-codec kernel driver — ~20 distinct levers (cache attributes/config, TLB flush,
+  register-bit/mode permutations, warmup, kick barriers, write order, link mode, …); (3) the
+  core MPP **service** layer (`mpp_service`/`mpp_iommu`) — IOMMU hardware refresh
+  (`rockchip_iommu_disable+enable` equivalent) and the cached-dma-buf buffer model, both negative.
+  Whatever the vendor stack does to arm the compound decision leaves **no trace** in any register,
+  buffer, IOMMU operation, or memory attribute we can observe or control from a V4L2 driver.
+
+**Net:** the open question below is now backed by an exhaustive, layer-by-layer negative result,
+not just a register diff — it needs the VDPU383 hardware documentation (the internal entropy /
+cross-frame state machine that arms compound prediction). See `docs/COMPOUND_BUG.md`.
 
 ---
 
