@@ -1,10 +1,18 @@
-# VP9 throughput — root-caused 2026-06-05: it was the compound bug all along
+# VP9 throughput — root-caused 2026-06-05: it was the reference-bypass bug all along
+
+> **Terminology note (2026-06-13):** this doc says "compound bug" throughout; read
+> it as the **small-MC-footprint reference-bypass bug**
+> ([`REF_BYPASS_BUG.md`](REF_BYPASS_BUG.md)). The content that stalls real-content
+> throughput is the small prediction-heavy inter frames (which correlate with
+> compound/alt-ref usage but are not caused by compound mode). The throughput data,
+> the MPP baseline, and the flush-only-after-restore fix below are all unaffected
+> by the re-characterisation.
 
 Board: NanoPi R76S #1 `.165`, kernel 7.0.1, current OOT driver. Measured after
 the `irq_split` experiment came back negative (SESSION_2026-06-05_FINALISATION.md),
 to find where the throughput actually goes. **Headline: there is no raw decoder
-throughput problem. Every prior "slow" number was the vendor compound bug
-stalling real content via timeouts.**
+throughput problem. Every prior "slow" number was the vendor reference-bypass bug
+stalling real content via timeouts on its small prediction-heavy frames.**
 
 ## Method
 
@@ -40,11 +48,8 @@ v4l2slvp9dec ! fakesink sync=false`, performance governor unless noted.
 - cpuidle / PM-QoS deep-idle: **no effect** (confirms session_e; the `cpu-sleep`
   370 µs state is not on the critical path for back-to-back decode).
 - governor: **performance = +21%** over ondemand and removes the cold-start ramp
-  dip (ondemand's first run is ~210 fps then settles ~288; performance settled at
-  324–326 in these runs). The driver's per-frame CPU glue is mildly freq-sensitive.
-- **Caveat (later finding):** at full clock these per-frame rates show large
-  run-to-run *multi-modal* variance; the single figures here are best-case, not
-  guaranteed steady-state.
+  dip (ondemand's first run is ~210 fps then settles ~288; performance is a flat
+  324–326). The driver's per-frame CPU glue is mildly freq-sensitive.
 
 ## Result 2 — realtime at the target resolutions
 
@@ -67,14 +72,6 @@ via-gst number understates decode capability — most at 4K.
 VDPU383 silicon** (proven previously), so 52 fps is **our driver's per-frame
 efficiency, not silicon.** There is a ~13% per-frame HW gap to MPP at 4K to close
 to reach realtime@60.
-
-> **[Corrected by the Follow-up below + later work:** the flush A/B found this is
-> only *part* of the gap, and its biggest *relative* win is at **720p (1.82×), not
-> 4K (1.13×)** — so "scales with frame memory / hits 4K hardest" is wrong. The MPP
-> native baseline (Follow-up) does complex 4K at ~136 fps, so the per-frame gap to
-> MPP is ~2.3–3×, not "~13%" (the 13% was only the shortfall to 60 fps realtime).
-> The residual is the per-frame HW **decode time** itself — RK3576 is single-core,
-> so not pipelining; reg13/cache/clocks/FBC have since been ruled out.]**
 
 **Prime suspect for the 4K gap:** the driver calls `iommu_flush_iotlb_all()`
 **before every kick** (`rkvdec-vdpu383-vp9.c:3265`). A full domain TLB flush
@@ -179,25 +176,21 @@ clean content, performance governor, averaged over many 100-frame windows:
   `iommu_restore` (error recovery re-attaches the domain and can leave stale
   entries). **Clean fix: flush only after a restore, not every frame.**
 - This is only *part* of the gap: even no-flush we're ~2× behind MPP
-  (575 vs 1189 @720p). The remainder is the **per-frame HW decode time itself**
-  — MPP's entire end-to-end 720p frame (0.84 ms) is shorter than our pure-HW
-  decode window alone (1.93 ms), so the gap is inside the decode, not in
-  inter-frame start/stop. RK3576 has a **single decode core**, so it cannot be
-  closed by inter-frame pipelining (there is no second decode to overlap); the
-  lever (still open) is whatever makes MPP's per-frame HW decode faster on the
-  same silicon — reg13, decoder cache, clocks and FBC have since been tested and
-  ruled out.
+  (575 vs 1189 @720p). The remainder is almost certainly MPP's **link-mode
+  pipelining** (decode N+1 overlaps N's completion) + our per-frame IP
+  start/stop, which my pure-HW (kick→IRQ) measurement doesn't even include —
+  i.e. the *end-to-end* gap is larger still.
 
 ### Net
 
 - **Throughput for real content is gated on the compound bug** (complex content
   is compound; our decoder stalls). This is the dominant fact.
-- **The throughput levers:** (1) flush-only-after-restore (~1.3–2.5 ms/frame,
-  correctness-safe, ~doubles 720p) — landed. (2) The larger remaining ~2× is the
-  **per-frame HW decode time itself** (memory-bandwidth-bound). RK3576 is
-  single-core, so it cannot be closed by inter-frame pipelining; reg13, decoder
-  cache, clocks and FBC have been ruled out, so the lever is still open. Neither
-  is needed for 720p/1080p realtime today on compound-free content.
+- **Two concrete driver optimizations exist** for compound-free / once-compound-fixed
+  throughput: (1) flush-only-after-restore (~1.3–2.5 ms/frame, correctness-safe,
+  ~doubles 720p); (2) link-mode pipelining to overlap inter-frame overhead (the
+  larger remaining ~2× — bigger lift, needs the link path which currently also
+  fails on compound). Neither is needed for 720p/1080p realtime today on
+  compound-free content.
 
 ### LANDED: flush-only-after-restore (validated)
 
@@ -216,9 +209,8 @@ Validation:
 - Error recovery still flushes (the one case it's genuinely needed) by design.
 - Throughput: 1.82× @720p, 1.32× @1080p, 1.13× @4K.
 
-Remaining ~2× to MPP is the per-frame HW decode time itself (memory-bandwidth-
-bound; RK3576 is single-core, so not closable by inter-frame pipelining) — and
-moot for real content until the compound bug is fixed.
+Remaining ~2× to MPP is link-mode pipelining + per-frame IP start/stop (separate,
+larger lift) — and moot for real content until the compound bug is fixed.
 
 New gated params (default off/inert): `vp9_time` (per-frame HW decode timing).
 `vp9_skip_tlb_flush` now selects flush policy (default 0 = the landed fix). Clean

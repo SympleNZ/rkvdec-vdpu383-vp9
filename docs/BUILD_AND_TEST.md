@@ -69,7 +69,8 @@ Notes:
 ```sh
 python3 fluster.py run -d GStreamer-VP9-V4L2SL -ts VP9-TEST-VECTORS -j1
 # Current: 148/305 strict-MD5. See CONFORMANCE.md for the per-cluster breakdown
-# (the bulk of the misses are the compound bug + downstream gst/comparator).
+# (the bulk of the misses are the reference-bypass bug — small-footprint inter
+#  frames, REF_BYPASS_BUG.md — plus downstream gst/comparator).
 ```
 
 **Reboot before a fresh baseline** — decoder/HW state bleeds across runs and can
@@ -83,8 +84,8 @@ turn a clean run into a timeout-laden one. Throughput in particular swings wildl
 |---|---|
 | `vp9_skip_tlb_flush` | IOMMU TLB-flush policy: `0` flush-only-after-restore (default, the throughput fix), `1` never (debug), `2` always per-frame (old behaviour / A-B baseline) |
 | `vp9_time` | print mean pure-HW decode time (kick→DONE IRQ) every 100 frames |
-| `rkvdec_link_mode` | `0` single-shot submit (default), `1` link/batched submit (experimental — does not improve throughput on RK3576's single decode core, and currently fails on compound content) |
-| `vp9_perturb_refs` | diagnostic: redirect a compound frame's non-alt reference legs to a scratch buffer (used to prove compound never engages — see COMPOUND_BUG.md) |
+| `rkvdec_link_mode` | `0` single-shot submit (default), `1` link/batched submit |
+| `vp9_perturb_refs` | diagnostic: redirect a small inter frame's non-alt reference legs to a scratch buffer; output unchanged proves the references are not read (see REF_BYPASS_BUG.md) |
 | `vp9_dump_ctrls` | dump each frame's `v4l2_ctrl_vp9_frame` as one hex line |
 
 Several other `r3x`/`r4x` and `vp9_*` parameters are retained inert experimental
@@ -98,6 +99,7 @@ defaults.
   /sys/kernel/debug/dynamic_debug/control`) and read `/dev/kmsg` during decode
   (the dmesg ring drops the fast per-frame lines under load).
 - Counting compound frames in a clip: decode to `fakesink` with the above
-  enabled and `grep -c 'refmode=2'`.
+  enabled and `grep -c 'refmode=2'`. (Compound correlates with the failing
+  small-footprint frames but is not the cause — single-ref small frames fail too.)
 - Pure HW decode rate: `vp9_time=1` + `performance` governor + compound-free
   content.

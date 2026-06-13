@@ -1,5 +1,15 @@
 # VP9 conformance tail — accurately characterized (2026-06-05)
 
+> **Correction (2026-06-13):** this doc originally treated the small-dimension
+> single-ref inter failure as a *distinct* bug from the "compound bug." They are
+> **the same bug** — the small-MC-footprint reference-bypass in
+> [`REF_BYPASS_BUG.md`](REF_BYPASS_BUG.md). A 64×64 single-ref inter frame is
+> perturb-immune exactly like the small-coded-footprint compound frames (proven
+> 2026-06-13: redirecting its references changes nothing). "Small by dimension"
+> and "small by sparse coding" are two routes to the same small-footprint trigger.
+> Read the per-cluster analysis below with that unification in mind; the
+> "two kernel bugs" / "distinct from the compound bug" phrasings are superseded.
+
 Working through the "remaining open items", I re-examined the Fluster failure
 clusters (`VP9-TEST-VECTORS`, 148/305 pass) by decoding individual vectors and
 comparing our output to the libvpx (ffmpeg) reference directly — rather than
@@ -52,6 +62,12 @@ concluded "HW decodes 8×8 perfectly, the failure is the userspace comparator."
 That was based on a single (KEY) frame's buffer dump; the inter frames are
 actually wrong. Comment updated.
 
+**(2026-06-13 unification: this "small-dimension single-ref INTER" failure is the
+same bug as the reference-bypass centrepiece — a small-MC-footprint frame reading
+a stale internal reference. The 64×64 inter frames are perturb-immune, identical
+to the small-coded compound frames. It is `refmode=0` here, which is why it also
+proves the bug is not compound-specific.)**
+
 ## Resize cluster (`vp90-2-21-resize_inter_*`, `vp90-2-14-resize-*`) — downstream gst
 
 `vp90-2-21-resize_inter_320x180_5_1-2`: `gst_rc=0`, our output 864000 B (10
@@ -65,19 +81,18 @@ Downstream (gst), not a kernel decode bug.
 
 The 157 Fluster failures are NOT one downstream bucket. They are:
 
-1. **Compound (`refmode=2`)** — the vendor bug (the dominant correctness
-   blocker; → publish + Detlev).
-2. **Small-dimension single-ref INTER** — a **real, distinct driver bug** (~half
-   the `size` cluster, aligned widths). NEW finding; previously misfiled as
-   "downstream". A tractable-looking lead (inter MC stride/edge at small dims).
-3. **Small-dimension non-aligned width** — output carries HW bytesperline
+1. **Small-MC-footprint reference-bypass** — the vendor bug
+   ([`REF_BYPASS_BUG.md`](REF_BYPASS_BUG.md)). This covers **both** the
+   compound (`refmode=2`) frames and the small-dimension single-ref (`refmode=0`)
+   frames — they are one bug (proven 2026-06-13). The dominant correctness blocker.
+2. **Small-dimension non-aligned width** — output carries HW bytesperline
    padding; a crop/de-stride gap (driver could set the V4L2 crop rectangle, or
    userspace must honour bytesperline). Borderline-downstream.
-4. **Resize** — gst-plugins-bad `copy_output_buffer` (downstream).
-5. **10-bit** — correct to ±1 rounding (strict-MD5 intolerance), not a defect.
+3. **Resize** — gst-plugins-bad `copy_output_buffer` (downstream).
+4. **10-bit** — correct to ±1 rounding (strict-MD5 intolerance), not a defect.
 
-Two genuinely-kernel correctness items remain: the compound bug (vendor) and the
-**small-dim single-ref inter bug (ours, newly found)**.
+One genuinely-kernel correctness bug remains: the small-MC-footprint
+reference-bypass (vendor / below-MMIO), in its compound and small-dimension forms.
 
 ## Small-dim inter bug — bounded: conformance-only, ZERO real-world impact
 
@@ -106,7 +121,7 @@ HW MC engine assumes 64-aligned reference UV internally, it reads chroma (and vi
 edge effects, luma) from the wrong offset on tiny frames. Self-consistent for our
 own-decoded refs only if the HW honours the programmed stride for both write and
 MC-read; a divergence there fits the symptom. Untested — would need a per-vector
-MPP register-diff (the compound-bug tooling) to confirm/fix, for conformance-only
+MPP register-diff (the ref-bypass-bug tooling) to confirm/fix, for conformance-only
 gain.
 
 **Disposition:** real-world-irrelevant. Documented as a precise known limitation
@@ -134,8 +149,9 @@ Stride values via the `rkvdec-vp9 fmt:` pr_debug:
   content density (synthetic 64×64 = 8.6%; conformance size-64x* = 70–85%). Not
   any obvious dimension register.
 
-This is the **same class as the compound bug**: a tiny-frame HW-execution
-difference not expressed in the visible register values. The next step is the
+This is **the same bug as the reference-bypass centrepiece** (confirmed
+2026-06-13, not just "same class"): a small-MC-footprint HW-execution difference
+not expressed in the visible register values. The next step is the
 full per-vector **MPP register-diff**, but the `.104` MPP dump build
 (`builddir-dump` with `DUMP_VDPU383_DATAS`) is **gone** and would need a
 compound-scale rebuild. **Deferred** — not worth a multi-session, cross-board
