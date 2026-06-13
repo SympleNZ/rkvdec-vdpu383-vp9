@@ -111,6 +111,19 @@ reference is read for these frames.)
 > Confirmed on **both** repro classes: redirecting refs leaves the compound F2 *and*
 > the single-ref 64×64 inter frames byte-identical. Same bug.
 
+### The retained reference is seeded by the immediately-preceding decode
+
+If the failing frame's reference comes from internal retention rather than DRAM,
+*what* is retained? It is the previous decode's reconstruction. Decoding the
+`KEY + hidden-alt-ref(F1) + shown(F2)` repro with F1's decode **skipped** (the
+driver's `r50_skip_altref`) changes F2's output (`6b3c7a8a` → `13673718`). Since
+F2 ignores its programmed reference addresses (above), the only channel by which
+skipping the preceding frame can move F2 is the **internal retained reference** —
+so F2's motion comp is served from whatever the immediately-preceding decode left
+in the hardware (F1 normally; the KEY when F1 is skipped). The retained copy is
+real reconstructed content from the prior frame, not a re-fetch — which is why
+redirecting F2's addresses afterwards has no effect.
+
 ### MPP decodes it correctly and IS address-sensitive (same silicon)
 
 On the BSP board, MPP decodes the same frame byte-exact to libvpx. A one-line
