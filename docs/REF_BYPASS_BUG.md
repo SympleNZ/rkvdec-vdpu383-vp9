@@ -144,6 +144,12 @@ reference. All explicit experiments:
 - **Our reference addresses are correct, not fallbacks** — `ref_lookup_fallback=0`
   across every lookup on the failing clip; each reg170-172 value resolves via the
   normal by-timestamp `vb2_find_buffer` path, the same path HEVC uses.
+- **Buffer address / size alignment** — output buffers are 4 MB-aligned, and the
+  cleanest repro (the 64×64 single-ref clip) has a hor-stride **identical to MPP's**
+  (192), 8-aligned dimensions, and aligned buffers — and it still bypasses. So
+  alignment is not the trigger. (Our hor-align does diverge from MPP at large
+  widths — 1472 vs 1280 for a 1280-wide frame — but the small repro that fails has
+  the same stride as MPP, so that divergence is a separate matter, not this bug.)
 - **Completion is clean** — the failing frame finishes with a clean DEC_RDY IRQ
   (`sta=0x01`), no error bits, no soft-reset, no timeout.
 - **Decoder cache** — clearing CACHE0/1/2 per frame, alone or combined with the
