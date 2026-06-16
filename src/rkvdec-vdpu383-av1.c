@@ -11,12 +11,17 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/hw_bitfield.h>	/* FIELD_PREP_WM16 (link-mode INT_EN write-mask) */
 #include <linux/dma-buf.h>
+#include <linux/dma-mapping.h>
+#include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/kernel.h>
+#include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/crc32.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-mem2mem.h>
@@ -24,6 +29,25 @@
 #include "rkvdec.h"
 #include "rkvdec-rcb.h"
 #include "rkvdec-vdpu383-regs.h"
+#include "rkvdec-link.h"
+
+/*
+ * Link/CCU submission (2026-06-16). The order trace on the BSP board showed MPP
+ * runs AV1 in link/CCU mode (per-frame rkvdec2_link_enqueue + iommu_flush_tlb,
+ * zero per-frame register MMIO), while our AV1 path is single-shot direct-MMIO.
+ * That is the one structural divergence never tested for AV1, and AV1's bug is
+ * the per-module-load init/metastability class — exactly what continuous link
+ * submission could pin differently. We reuse the proven codec-agnostic link
+ * machinery (job_ready backpressure, watchdog/IRQ reap on ctx->link_table) the
+ * VP9/H.264 paths already use; it is gated entirely on rkvdec_link_mode.
+ *
+ * Gating note: unlike VP9/H.264 (which allocate link_table unconditionally),
+ * AV1 allocates it ONLY when rkvdec_link_mode is set, so the single-shot
+ * default path — where the non-determinism bug is characterised — stays
+ * byte-for-byte unchanged (link_table NULL, watchdog NULL-guard active as
+ * today). See AV1_LINK_MODE_PLAN_2026-06-16.md.
+ */
+extern int rkvdec_link_mode;
 
 /* -----------------------------------------------------------------------
  * Constants
@@ -173,6 +197,7 @@ struct rkvdec_vdpu383_av1_ctx {
 	 * the per-slot noncoeff_cdf/coeff_cdf buffers.
 	 */
 	struct rkvdec_aux_buf default_prob_buf;
+	bool default_prob_cached;	/* 2026-06-10: gated cached (dma_alloc_noncoherent) default_prob */
 	/* Per-DPB-slot shared buffer mirroring MPP's `cdf_segid_bufs` layout:
 	 * one allocation per slot containing noncoef CDF (offset 0, 6944 bytes),
 	 * coef CDF (offset 6944, 22656 bytes for 4 Q-bands), and segid map
@@ -236,6 +261,14 @@ struct rkvdec_vdpu383_av1_ctx {
 	 * successful decode.
 	 */
 	u8	colmv_valid_mask;
+
+	/*
+	 * Link/CCU descriptor ring. Allocated by av1_start ONLY when
+	 * rkvdec_link_mode is set; ctx->link_table points here so the
+	 * codec-agnostic reap/job_ready machinery engages. NULL (and
+	 * unused) in the single-shot default path.
+	 */
+	struct rkvdec_link_table	link_table;
 };
 
 /* -----------------------------------------------------------------------
@@ -1222,6 +1255,15 @@ static u8 av1_coeff_qband_idx(u8 base_q_idx)
 	return 3;
 }
 
+/* 2026-06-10 — replicate MPP's cached-dma-buf model for the CDF *input* the HW reads
+ * every KEY frame (default_prob): allocate it cacheable (dma_alloc_noncoherent) + sync,
+ * instead of our uncached dma_alloc_coherent. Tests whether the buffer MEMORY ATTRIBUTE
+ * (cacheable vs non-cacheable, as seen by the HW through the IOMMU) affects the decode —
+ * the last untested service-layer difference. */
+int av1_cached_prob;
+module_param(av1_cached_prob, int, 0644);
+MODULE_PARM_DESC(av1_cached_prob, "Allocate default_prob (CDF input) cacheable + sync; 0=off");
+
 /* -----------------------------------------------------------------------
  * Session teardown helper — frees all DMA allocations.
  * Called both from start() error path and stop().
@@ -1240,7 +1282,17 @@ static void rkvdec_vdpu383_av1_free_bufs(struct rkvdec_ctx *ctx,
 } while (0)
 
 	FREE_BUF(av1_ctx->gbl_buf);
-	FREE_BUF(av1_ctx->default_prob_buf);
+	/* cache-aware free: noncoherent alloc needs dma_free_noncoherent (matched). */
+	if (av1_ctx->default_prob_cached) {
+		if (av1_ctx->default_prob_buf.cpu) {
+			dma_free_noncoherent(rkvdec->dev, av1_ctx->default_prob_buf.size,
+					     av1_ctx->default_prob_buf.cpu,
+					     av1_ctx->default_prob_buf.dma, DMA_TO_DEVICE);
+			av1_ctx->default_prob_buf.cpu = NULL;
+		}
+	} else {
+		FREE_BUF(av1_ctx->default_prob_buf);
+	}
 	FREE_BUF(av1_ctx->strm_scratch);
 	for (i = 0; i < AV1_NUM_REF_FRAMES; i++)
 		FREE_BUF(av1_ctx->cdf_segid[i]);
@@ -1309,7 +1361,14 @@ static int rkvdec_vdpu383_av1_start(struct rkvdec_ctx *ctx)
 	 * KEY frames read reg184/reg178 from this buffer; INTER frames read from the
 	 * per-slot noncoeff_cdf/coeff_cdf buffers. */
 	av1_ctx->default_prob_buf.size = AV1_ALL_CDF_SIZE;
-	av1_ctx->default_prob_buf.cpu  = dma_alloc_coherent(rkvdec->dev,
+	av1_ctx->default_prob_cached = av1_cached_prob;
+	if (av1_ctx->default_prob_cached)
+		av1_ctx->default_prob_buf.cpu = dma_alloc_noncoherent(rkvdec->dev,
+							     av1_ctx->default_prob_buf.size,
+							     &av1_ctx->default_prob_buf.dma,
+							     DMA_TO_DEVICE, GFP_KERNEL);
+	else
+		av1_ctx->default_prob_buf.cpu = dma_alloc_coherent(rkvdec->dev,
 							     av1_ctx->default_prob_buf.size,
 							     &av1_ctx->default_prob_buf.dma,
 							     GFP_KERNEL);
@@ -1318,6 +1377,10 @@ static int rkvdec_vdpu383_av1_start(struct rkvdec_ctx *ctx)
 		goto err_free_bufs;
 	}
 	memcpy(av1_ctx->default_prob_buf.cpu, av1_default_cdf, AV1_ALL_CDF_SIZE);
+	/* cacheable: flush the CPU-written default CDF to RAM so the HW reads it. */
+	if (av1_ctx->default_prob_cached)
+		dma_sync_single_for_device(rkvdec->dev, av1_ctx->default_prob_buf.dma,
+					   av1_ctx->default_prob_buf.size, DMA_TO_DEVICE);
 
 	/* Stream scratch — synthetic OBU framing + V4L2 bitstream copy. */
 	av1_ctx->strm_scratch.size = 64 * 1024;
@@ -1418,6 +1481,26 @@ static int rkvdec_vdpu383_av1_start(struct rkvdec_ctx *ctx)
 		}
 	}
 
+	/*
+	 * Link/CCU descriptor ring — allocated only when link mode is enabled
+	 * (see header note). Mirrors vp9.c L733-742: init the inflight ring
+	 * and point ctx->link_table at our table so the codec-agnostic
+	 * job_ready/reap machinery treats AV1 like VP9. The single-shot default
+	 * (rkvdec_link_mode=0) leaves ctx->link_table NULL — unchanged path.
+	 */
+	if (rkvdec_link_mode) {
+		spin_lock_init(&ctx->inflight_lock);
+		ctx->inflight_head = 0;
+		ctx->inflight_tail = 0;
+
+		ret = rkvdec_link_alloc_table(&av1_ctx->link_table, rkvdec->dev,
+					      &rkvdec_link_vdpu383_info,
+					      /* task_capacity */ 16);
+		if (ret)
+			goto err_free_bufs;
+		ctx->link_table = &av1_ctx->link_table;
+	}
+
 	ctx->priv = av1_ctx;
 	return 0;
 
@@ -1431,6 +1514,28 @@ err_free_ctx:
 static void rkvdec_vdpu383_av1_stop(struct rkvdec_ctx *ctx)
 {
 	struct rkvdec_vdpu383_av1_ctx *av1_ctx = ctx->priv;
+	struct rkvdec_dev *rkvdec = ctx->dev;
+
+	/*
+	 * Link/CCU teardown (only allocated when rkvdec_link_mode). Mirror
+	 * vp9_stop: drain any task still parked in the inflight ring (fd closed
+	 * mid-decode before IRQ/watchdog reaped it), dropping its pm ref to keep
+	 * runtime-pm balanced, then clear the pointers and free the table.
+	 */
+	if (ctx->link_table) {
+		while (rkvdec_inflight_depth(ctx) > 0) {
+			struct rkvdec_link_inflight e = rkvdec_inflight_pop(ctx);
+
+			if (!e.src || !e.dst)
+				break;
+			v4l2_m2m_buf_done(e.src, VB2_BUF_STATE_ERROR);
+			v4l2_m2m_buf_done(e.dst, VB2_BUF_STATE_ERROR);
+			pm_runtime_put_autosuspend(rkvdec->dev);
+		}
+		ctx->link_table = NULL;
+		rkvdec->link_ctx = NULL;
+		rkvdec_link_free_table(&av1_ctx->link_table);
+	}
 
 	rkvdec_vdpu383_av1_free_bufs(ctx, av1_ctx);
 	kfree(av1_ctx);
@@ -1492,7 +1597,28 @@ static void rkvdec_vdpu383_av1_stop(struct rkvdec_ctx *ctx)
  * not enabled, no error processing is configured, and the trigger goes
  * nowhere — the symptom is "Frame processing timed out!" with no IRQ.
  */
-static void vdpu383_av1_config_common_regs(struct rkvdec_ctx *ctx)
+/*
+ * Register-write sink. Single-shot targets MMIO (rkvdec->regs); link mode
+ * targets a CPU reg_image[256] that becomes the link descriptor (so the IP
+ * runs as a real link node and the HW produces the per-descriptor completion
+ * writeback). image == NULL  =>  write MMIO (single-shot, unchanged).
+ * See AV1_FAITHFUL_CCU_PORT_PLAN_2026-06-16.md.
+ */
+struct av1_reg_sink {
+	void __iomem	*mmio;	/* rkvdec->regs — single-shot */
+	u32		*image;	/* reg_image[256] — link mode; NULL in single-shot */
+};
+
+static inline void av1_w(const struct av1_reg_sink *s, u32 byte_off, u32 val)
+{
+	if (s->image)
+		s->image[byte_off >> 2] = val;
+	else
+		writel(val, s->mmio + byte_off);
+}
+
+static void vdpu383_av1_config_common_regs(struct rkvdec_ctx *ctx,
+					   const struct av1_reg_sink *sink)
 {
 	struct rkvdec_dev *rkvdec = ctx->dev;
 	const struct v4l2_pix_format_mplane *pfmt = &ctx->decoded_fmt.fmt.pix_mp;
@@ -1546,8 +1672,12 @@ static void vdpu383_av1_config_common_regs(struct rkvdec_ctx *ctx)
 	common.reg029_debug_perf_latency_ctrl1.aw_count_id        = 0;
 	common.reg029_debug_perf_latency_ctrl1.rd_band_width_mode = 0;
 
-	rkvdec_memcpy_toio(rkvdec->regs + VDPU383_OFFSET_COMMON_REGS,
-			   &common, sizeof(common));
+	if (sink->image)
+		memcpy(&sink->image[VDPU383_OFFSET_COMMON_REGS >> 2],
+		       &common, sizeof(common));
+	else
+		rkvdec_memcpy_toio(rkvdec->regs + VDPU383_OFFSET_COMMON_REGS,
+				   &common, sizeof(common));
 }
 
 /* -----------------------------------------------------------------------
@@ -2174,6 +2304,43 @@ static void vdpu383_av1_config_global_hdr(
  * Stride unit: hw_stride = bytesperline >> 4 (16-byte words), same as VP9.
  * All DMA addresses: lower 32-bit (IOMMU handles remapping).
  */
+
+/*
+ * 2026-06-08 BSP-infra probe: RCB re-pack. The BSP/MPP packs the AV1 RCB slots
+ * BYTE-EXACT (cumulative offsets, ZERO padding) in a specific order; our shared
+ * allocator pads every slot +4KB and 4KB-aligns, displacing the INTRA_IN_ROW
+ * (reg148) intra-above-row-context buffer — the locus of the partial-decode bug.
+ * av1_mpp_rcb=1 overrides the per-slot RCB register writes with MPP's exact 1080p
+ * layout (captured from .104 mpp_dev_debug) anchored at our RCB block base,
+ * WITHOUT touching the shared allocator. 1080p-specific (test on bbb1080_av1).
+ */
+static int av1_mpp_rcb;
+module_param(av1_mpp_rcb, int, 0644);
+MODULE_PARM_DESC(av1_mpp_rcb, "AV1 re-pack RCB byte-exact to MPP 1080p layout (0=off,1=on) — partial-decode probe");
+
+/*
+ * Cat 5.1 IOMMU access trace (2026-06-09), AV1 analogue of vp9_iova_fault.
+ * Point the slot-4 INTRA_IN_ROW RCB (reg148 — the intra above-row context, the
+ * partial-decode bug locus) at a deliberately UNMAPPED IOVA sentinel and read
+ * the rk_iommu page-fault address+type during one decode of a partial clip:
+ *   - fault "type write" at the sentinel -> HW writes the above-row context as
+ *     it decodes rows (so the buffer IS produced);
+ *   - fault "type read"  -> HW reads above-row context (for lower SB rows);
+ *   - NO fault at all -> HW never touches slot-4 -> it never uses intra
+ *     above-row context, which would directly explain the flat/DC lower rows.
+ * Default off.
+ */
+static int av1_iova_fault;
+module_param(av1_iova_fault, int, 0644);
+MODULE_PARM_DESC(av1_iova_fault, "Point slot-4 INTRA_IN_ROW RCB at an UNMAPPED IOVA sentinel to fault-trace HW above-row-context access (Cat 5.1). 1=on.");
+
+/* 2026-06-10 — also zero reg31-63 (the gap our register-init loops skip but MPP's
+ * full memset covers; reg32=BSP TIMEOUT_THRESHOLD lives here). Probe whether a stale
+ * gap register drives the ~50% AV1 metastability. */
+static int av1_zero_gap;
+module_param(av1_zero_gap, int, 0644);
+MODULE_PARM_DESC(av1_zero_gap, "AV1 also zero reg31-63 (gap MPP memsets, we skip); 0=off");
+
 static void vdpu383_av1_config_addr_regs(
 	struct rkvdec_ctx *ctx,
 	const struct v4l2_ctrl_av1_frame *fp,
@@ -2183,7 +2350,8 @@ static void vdpu383_av1_config_addr_regs(
 	struct vb2_v4l2_buffer *dst_buf,
 	struct rkvdec_vdpu383_av1_ctx *av1_ctx,
 	u8 cdf_slot,
-	bool is_key)
+	bool is_key,
+	const struct av1_reg_sink *sink)
 {
 	struct rkvdec_dev *rkvdec = ctx->dev;
 	const struct v4l2_pix_format_mplane *pfmt = &ctx->decoded_fmt.fmt.pix_mp;
@@ -2200,9 +2368,16 @@ static void vdpu383_av1_config_addr_regs(
 		int reg;
 
 		for (reg = 8; reg <= 30; reg++)
-			writel(0, rkvdec->regs + reg * 4);
+			av1_w(sink, reg * 4, 0);
+		/* 2026-06-10 — the existing loops skip reg31-63 (offsets 0x7c-0xfc),
+		 * leaving them STALE on the HW while MPP memsets the whole reg struct.
+		 * reg32 (BSP TIMEOUT_THRESHOLD) lives here. Gated test of whether a
+		 * stale gap register is the source of the ~50% AV1 metastability. */
+		if (av1_zero_gap)
+			for (reg = 31; reg <= 63; reg++)
+				av1_w(sink, reg * 4, 0);
 		for (reg = 64; reg <= 232; reg++)
-			writel(0, rkvdec->regs + reg * 4);
+			av1_w(sink, reg * 4, 0);
 	}
 	/* Session 26: MPP uses the CODED frame height for reg70 (Y plane size),
 	 * NOT the V4L2 padded buffer height.  V4L2 reports pfmt->height padded to
@@ -2277,26 +2452,26 @@ static void vdpu383_av1_config_addr_regs(
 				       av1_ctx->strm_scratch.size - used);
 			}
 
-			writel(0, rkvdec->regs + AV1R_STRM_START_BIT);
-			writel(ALIGN(strm_len + prefix_n + 15, 128),
-			       rkvdec->regs + AV1R_STRM_LEN);
-			writel(lower_32_bits(av1_ctx->strm_scratch.dma),
-			       rkvdec->regs + AV1R_STRM_BASE);
+			av1_w(sink, AV1R_STRM_START_BIT, 0);
+			av1_w(sink, AV1R_STRM_LEN,
+			      ALIGN(strm_len + prefix_n + 15, 128));
+			av1_w(sink, AV1R_STRM_BASE,
+			      lower_32_bits(av1_ctx->strm_scratch.dma));
 		} else {
 			/* Fallback to original V4L2 source buffer. */
 			if (src_cpu)
 				memunmap(src_cpu);
-			writel(0, rkvdec->regs + AV1R_STRM_START_BIT);
-			writel(ALIGN(strm_len + 15, 128),
-			       rkvdec->regs + AV1R_STRM_LEN);
-			writel(lower_32_bits(src_dma),
-			       rkvdec->regs + AV1R_STRM_BASE);
+			av1_w(sink, AV1R_STRM_START_BIT, 0);
+			av1_w(sink, AV1R_STRM_LEN,
+			      ALIGN(strm_len + 15, 128));
+			av1_w(sink, AV1R_STRM_BASE,
+			      lower_32_bits(src_dma));
 		}
 	}
 
 	/* ---- Global header ---- */
-	writel(VDPU383_AV1_GBL_LEN, rkvdec->regs + AV1R_GBL_LEN);
-	writel(lower_32_bits(av1_ctx->gbl_buf.dma), rkvdec->regs + AV1R_GBL_BASE);
+	av1_w(sink, AV1R_GBL_LEN, VDPU383_AV1_GBL_LEN);
+	av1_w(sink, AV1R_GBL_BASE, lower_32_bits(av1_ctx->gbl_buf.dma));
 
 	/* Session 25 part 5: pre-zero reg64 and reg71-106 to match MPP's
 	 * memset of the whole comm_paras struct.  Reg65-70 are set explicitly
@@ -2304,29 +2479,29 @@ static void vdpu383_av1_config_addr_regs(
 	 * Without zeroing reg64, it carries stale value (~0xCC02CBC1) from
 	 * a prior frame or another codec's session - MPP's regs_full.dat
 	 * dump shows MPP zeros it via gen_regs memset. */
-	writel(0, rkvdec->regs + 64 * 4);
+	av1_w(sink, 64 * 4, 0);
 	{
 		int reg;
 
 		for (reg = 71; reg <= 106; reg++)
-			writel(0, rkvdec->regs + reg * 4);
+			av1_w(sink, reg * 4, 0);
 	}
 
 	/* ---- Output frame strides and DMA ---- */
-	writel(hw_hor,      rkvdec->regs + AV1R_HOR_STRIDE);
-	writel(hw_hor,      rkvdec->regs + AV1R_UV_HOR_STRIDE);
-	writel(hw_y_stride, rkvdec->regs + AV1R_Y_STRIDE);
+	av1_w(sink, AV1R_HOR_STRIDE,    hw_hor);
+	av1_w(sink, AV1R_UV_HOR_STRIDE, hw_hor);
+	av1_w(sink, AV1R_Y_STRIDE,      hw_y_stride);
 
 	/* MPP `hal_av1d_vdpu383.c:345-347` mirrors reg68/69/70 into reg80/81/82
 	 * (error_ref strides). Without these, error-ref reads use stride 0
 	 * and either fault or produce garbage. */
-	writel(hw_hor,      rkvdec->regs + AV1R_ERR_REF_HOR_STRIDE);
-	writel(hw_hor,      rkvdec->regs + AV1R_ERR_REF_UV_STRIDE);
-	writel(hw_y_stride, rkvdec->regs + AV1R_ERR_REF_Y_STRIDE);
-	writel(lower_32_bits(dst_dma), rkvdec->regs + AV1R_DECOUT_BASE);
-	writel(lower_32_bits(dst_dma), rkvdec->regs + AV1R_ERR_REF_BASE);
-	writel(lower_32_bits(dst_dma), rkvdec->regs + AV1R_PAYLOAD_CUR_BASE);
-	writel(lower_32_bits(dst_dma), rkvdec->regs + AV1R_PAYLOAD_ERR_BASE);
+	av1_w(sink, AV1R_ERR_REF_HOR_STRIDE, hw_hor);
+	av1_w(sink, AV1R_ERR_REF_UV_STRIDE,  hw_hor);
+	av1_w(sink, AV1R_ERR_REF_Y_STRIDE,   hw_y_stride);
+	av1_w(sink, AV1R_DECOUT_BASE,      lower_32_bits(dst_dma));
+	av1_w(sink, AV1R_ERR_REF_BASE,     lower_32_bits(dst_dma));
+	av1_w(sink, AV1R_PAYLOAD_CUR_BASE, lower_32_bits(dst_dma));
+	av1_w(sink, AV1R_PAYLOAD_ERR_BASE, lower_32_bits(dst_dma));
 
 	/* ---- Reference frame DMA and strides ----
 	 *
@@ -2346,8 +2521,8 @@ static void vdpu383_av1_config_addr_regs(
 	{
 	}
 	for (i = 0; i < 16; i++) {
-		writel(0, rkvdec->regs + AV1R_LAST_REF_BASE + i * 4);
-		writel(0, rkvdec->regs + AV1R_PAYLOAD_REF_BASE + i * 4);
+		av1_w(sink, AV1R_LAST_REF_BASE + i * 4, 0);
+		av1_w(sink, AV1R_PAYLOAD_REF_BASE + i * 4, 0);
 	}
 
 	for (i = 0; i < AV1_REFS_PER_FRAME; i++) {
@@ -2366,13 +2541,13 @@ static void vdpu383_av1_config_addr_regs(
 			ref_dma = vb2_dma_contig_plane_dma_addr(
 					&dst_buf->vb2_buf, 0);
 		}
-		writel(lower_32_bits(ref_dma),
-		       rkvdec->regs + AV1R_LAST_REF_BASE + slot * 4);
-		writel(lower_32_bits(ref_dma),
-		       rkvdec->regs + AV1R_PAYLOAD_REF_BASE + slot * 4);
-		writel(hw_hor,      rkvdec->regs + stride_off);
-		writel(hw_hor,      rkvdec->regs + stride_off + 4);
-		writel(hw_y_stride, rkvdec->regs + stride_off + 8);
+		av1_w(sink, AV1R_LAST_REF_BASE + slot * 4,
+		      lower_32_bits(ref_dma));
+		av1_w(sink, AV1R_PAYLOAD_REF_BASE + slot * 4,
+		      lower_32_bits(ref_dma));
+		av1_w(sink, stride_off,     hw_hor);
+		av1_w(sink, stride_off + 4, hw_hor);
+		av1_w(sink, stride_off + 8, hw_y_stride);
 	}
 
 	/* ---- CDF + segid buffers (MPP shared-layout) ----
@@ -2386,12 +2561,12 @@ static void vdpu383_av1_config_addr_regs(
 		dma_addr_t cur_buf = av1_ctx->cdf_segid[cdf_slot].dma;
 
 		if (is_key || fp->primary_ref_frame == AV1_PRIMARY_REF_NONE) {
-			writel(lower_32_bits(av1_ctx->default_prob_buf.dma
-					     + AV1_NON_COEF_CDF_SIZE
-					     + (dma_addr_t)AV1_COEF_BAND_SIZE * qband),
-			       rkvdec->regs + AV1R_COEFF_CDF_BASE);
-			writel(lower_32_bits(av1_ctx->default_prob_buf.dma),
-			       rkvdec->regs + AV1R_NONCOEFF_CDF_BASE);
+			av1_w(sink, AV1R_COEFF_CDF_BASE,
+			      lower_32_bits(av1_ctx->default_prob_buf.dma
+					    + AV1_NON_COEF_CDF_SIZE
+					    + (dma_addr_t)AV1_COEF_BAND_SIZE * qband));
+			av1_w(sink, AV1R_NONCOEFF_CDF_BASE,
+			      lower_32_bits(av1_ctx->default_prob_buf.dma));
 		} else {
 			u8 pri     = fp->primary_ref_frame & 0x7;
 			u8 pri_dpb = fp->ref_frame_idx[pri] & AV1_DPB_SLOT_MASK;
@@ -2402,17 +2577,17 @@ static void vdpu383_av1_config_addr_regs(
 			/* Coeff CDF write-back always targets band 0; reads from
 			 * a prior slot must also use band 0 (no qband offset).
 			 * MPP ref_info_tbl[].coeff_idx is always 0 post-writeback. */
-			writel(lower_32_bits(ref_buf + AV1_NON_COEF_CDF_SIZE),
-			       rkvdec->regs + AV1R_COEFF_CDF_BASE);
-			writel(lower_32_bits(ref_buf),
-			       rkvdec->regs + AV1R_NONCOEFF_CDF_BASE);
+			av1_w(sink, AV1R_COEFF_CDF_BASE,
+			      lower_32_bits(ref_buf + AV1_NON_COEF_CDF_SIZE));
+			av1_w(sink, AV1R_NONCOEFF_CDF_BASE,
+			      lower_32_bits(ref_buf));
 		}
 		/* Write-back targets: current slot's shared buffer, offsets
 		 * 0 (noncoef) and 6944 (coef band 0). */
-		writel(lower_32_bits(cur_buf + AV1_NON_COEF_CDF_SIZE),
-		       rkvdec->regs + AV1R_COEFF_CDF_WB);
-		writel(lower_32_bits(cur_buf),
-		       rkvdec->regs + AV1R_NONCOEFF_CDF_WB);
+		av1_w(sink, AV1R_COEFF_CDF_WB,
+		      lower_32_bits(cur_buf + AV1_NON_COEF_CDF_SIZE));
+		av1_w(sink, AV1R_NONCOEFF_CDF_WB,
+		      lower_32_bits(cur_buf));
 
 		/* Segment ID maps live at offset AV1_ALL_CDF_SIZE within the
 		 * shared buffer. MPP `set_cdf_segid` only sets segid_last_base
@@ -2422,19 +2597,19 @@ static void vdpu383_av1_config_addr_regs(
 		 * read-write hazard: HW reads "previous segid" while writing
 		 * "current segid" in the same memory. */
 		if (is_key || fp->primary_ref_frame == AV1_PRIMARY_REF_NONE) {
-			writel(0, rkvdec->regs + AV1R_SEGID_LAST_BASE);
+			av1_w(sink, AV1R_SEGID_LAST_BASE, 0);
 		} else {
 			u8 pri     = fp->primary_ref_frame & 0x7;
 			u8 pri_dpb = fp->ref_frame_idx[pri] & AV1_DPB_SLOT_MASK;
 			u8 ref_slot = av1_ctx->dpb[pri_dpb].valid ?
 				av1_ctx->dpb[pri_dpb].cdf_slot : 0;
 
-			writel(lower_32_bits(av1_ctx->cdf_segid[ref_slot].dma
-					     + av1_ctx->segid_offset),
-			       rkvdec->regs + AV1R_SEGID_LAST_BASE);
+			av1_w(sink, AV1R_SEGID_LAST_BASE,
+			      lower_32_bits(av1_ctx->cdf_segid[ref_slot].dma
+					    + av1_ctx->segid_offset));
 		}
-		writel(lower_32_bits(cur_buf + av1_ctx->segid_offset),
-		       rkvdec->regs + AV1R_SEGID_CUR_BASE);
+		av1_w(sink, AV1R_SEGID_CUR_BASE,
+		      lower_32_bits(cur_buf + av1_ctx->segid_offset));
 	}
 
 	/* ---- ColMV buffers (1 current + 8 reference slots) ----
@@ -2461,7 +2636,7 @@ static void vdpu383_av1_config_addr_regs(
 		 * driver likely zeroes on the kernel side during fd→IOVA mapping;
 		 * mainline has no such hook, so do it here. */
 		memset(colmv_out_buf->cpu, 0, colmv_out_buf->size);
-		writel(lower_32_bits(colmv_out), rkvdec->regs + AV1R_COLMV_CUR_BASE);
+		av1_w(sink, AV1R_COLMV_CUR_BASE, lower_32_bits(colmv_out));
 
 		/* Build the per-slot colmv reference address table.
 		 *
@@ -2475,11 +2650,11 @@ static void vdpu383_av1_config_addr_regs(
 		 * initialised buffers and (per the embedded-pointer hypothesis)
 		 * follow their zero contents as IOVA=0 → IOMMU page fault. */
 		for (i = 0; i < 16; i++)
-			writel(0, rkvdec->regs + AV1R_COLMV_REF_BASE + i * 4);
+			av1_w(sink, AV1R_COLMV_REF_BASE + i * 4, 0);
 		for (i = 0; i < AV1_NUM_REF_FRAMES; i++) {
 			if (av1_ctx->dpb[i].valid)
-				writel(lower_32_bits(av1_ctx->colmv_ref[i].dma),
-				       rkvdec->regs + AV1R_COLMV_REF_BASE + i * 4);
+				av1_w(sink, AV1R_COLMV_REF_BASE + i * 4,
+				      lower_32_bits(av1_ctx->colmv_ref[i].dma));
 		}
 	}
 
@@ -2491,13 +2666,49 @@ static void vdpu383_av1_config_addr_regs(
 	 * faults at low addresses like 0x00202xxx (the RCB count's bit
 	 * pattern, with the per-entry stride from the buffer size).
 	 */
+	if (av1_mpp_rcb >= 1) {
+		/* MPP's exact 1080p AV1 RCB layout (.104 mpp_dev_debug): byte-packed,
+		 * 6 active slots, MPP pack order. {slot_idx=(reg-140)/2, offset, size}.
+		 * Anchored at our RCB block base (Variant 1 — no allocator change). */
+		static const u32 mpp_rcb[6][3] = {
+			{6,      0, 40128}, /* reg152 FLTD_IN_ROW       */
+			{2,  40128, 10368}, /* reg144 INTER_IN_ROW      */
+			{4,  50496,  7680}, /* reg148 INTRA_IN_ROW (bug)*/
+			{0,  58176,  3008}, /* reg140 STRMD_IN_ROW      */
+			{10, 61184, 52800}, /* reg160 FLTD_UPSC_ON_COL  */
+			{7, 113984, 40128}, /* reg154 FLTD_PROT_IN_ROW  */
+		};
+		dma_addr_t base = rkvdec_rcb_buf_dma_addr(ctx, 0);
+		int k;
+
+		for (i = 0; i < 14; i++) {
+			u32 off = AV1R_RCB_BASE + i * AV1R_RCB_SLOT_SIZE;
+
+			av1_w(sink, off, 0);
+			av1_w(sink, off + 4, 0);
+		}
+		for (k = 0; k < 6; k++) {
+			u32 off = AV1R_RCB_BASE + mpp_rcb[k][0] * AV1R_RCB_SLOT_SIZE;
+
+			av1_w(sink, off, lower_32_bits(base + mpp_rcb[k][1]));
+			av1_w(sink, off + 4, mpp_rcb[k][2]);
+		}
+	} else {
 	for (i = 0; i < rkvdec_rcb_buf_count(ctx); i++) {
 		u32 off = AV1R_RCB_BASE + i * AV1R_RCB_SLOT_SIZE;
 
-		writel(lower_32_bits(rkvdec_rcb_buf_dma_addr(ctx, i)),
-		       rkvdec->regs + off);
-		writel(rkvdec_rcb_buf_size(ctx, i),
-		       rkvdec->regs + off + 4);
+		if (av1_iova_fault && i == 4) {
+			/* Cat 5.1: redirect the intra above-row RCB to an unmapped
+			 * sentinel so any HW access (read/write) faults at a
+			 * recognisable address. */
+			av1_w(sink, off, 0xDEAD0000u);
+			av1_w(sink, off + 4, rkvdec_rcb_buf_size(ctx, i));
+			pr_info("AV1-IOVA-FAULT: slot4 INTRA_IN_ROW reg148 -> 0xdead0000 (UNMAPPED) size=%u\n",
+				rkvdec_rcb_buf_size(ctx, i));
+			continue;
+		}
+		av1_w(sink, off, lower_32_bits(rkvdec_rcb_buf_dma_addr(ctx, i)));
+		av1_w(sink, off + 4, rkvdec_rcb_buf_size(ctx, i));
 	}
 	/* Session 26 part 2: zero RCB slots beyond our buffer count so HW
 	 * doesn't dereference stale IOVAs from a previous codec session.
@@ -2507,8 +2718,9 @@ static void vdpu383_av1_config_addr_regs(
 	for (i = rkvdec_rcb_buf_count(ctx); i < 14; i++) {
 		u32 off = AV1R_RCB_BASE + i * AV1R_RCB_SLOT_SIZE;
 
-		writel(0, rkvdec->regs + off);
-		writel(0, rkvdec->regs + off + 4);
+		av1_w(sink, off, 0);
+		av1_w(sink, off + 4, 0);
+	}
 	}
 
 	(void)tge;
@@ -2524,6 +2736,19 @@ static void vdpu383_av1_config_addr_regs(
  * ref_order_hints[7] for each refreshed slot records the order hints of
  * LAST..ALTREF as seen by the frame just decoded — needed for §R next frame.
  */
+/*
+ * 2026-06-10 — AV1 deterministic signal (analogue of vp9_adapt_dump). The HW writes
+ * the adapted CDF into the cur slot (cdf_segid[cur_cdf_slot]) post-decode; the CDF is
+ * computed by the symbol decoder from the bitstream, so it should be DETERMINISTIC
+ * run-to-run even when the reconstructed pixels are not — separating entropy/parse
+ * (CDF) from reconstruction (intra above-row). cdf_segid is dma_alloc_coherent
+ * (CPU-coherent), so this read is safe (no memremap / vb2 scatter).
+ */
+static int av1_adapt_dump;
+module_param(av1_adapt_dump, int, 0644);
+MODULE_PARM_DESC(av1_adapt_dump,
+		 "Dump post-decode adapted-CDF CRC + bytes (deterministic AV1 signal); 0=off");
+
 static void rkvdec_vdpu383_av1_done(struct rkvdec_ctx *ctx,
 				     struct vb2_v4l2_buffer *src_buf,
 				     struct vb2_v4l2_buffer *dst_buf,
@@ -2554,6 +2779,17 @@ static void rkvdec_vdpu383_av1_done(struct rkvdec_ctx *ctx,
 	}
 
 	cdf_slot = av1_ctx->cur_cdf_slot;
+
+	if (av1_adapt_dump && av1_ctx->cdf_segid[cdf_slot].cpu) {
+		const u8 *p = av1_ctx->cdf_segid[cdf_slot].cpu;
+		u32 ncrc = crc32(0, p, AV1_NON_COEF_CDF_SIZE);
+		u32 ccrc = crc32(0, p + AV1_NON_COEF_CDF_SIZE, AV1_COEF_CDF_SIZE);
+
+		pr_info("av1 adapt-dump: ftype=%u order=%u slot=%u noncoef_crc=%08x coef_crc=%08x first16=%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+			fp->frame_type, fp->order_hint, cdf_slot, ncrc, ccrc,
+			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+			p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+	}
 
 	for (i = 0; i < AV1_NUM_REF_FRAMES; i++) {
 		if (!(fp->refresh_frame_flags & BIT(i)))
@@ -2605,6 +2841,88 @@ out:
 /* -----------------------------------------------------------------------
  * Task 10: main decode dispatch.
  */
+extern int vp9_time;	/* shared HW decode-time diagnostic gate (rkvdec.c) */
+
+/*
+ * 2026-06-08 BSP-infra probe: the BSP mpp_service clears the decoder read-caches
+ * (CACHE0/1/2) before every kick, and our VP9/H.264 backends mirror it — but this
+ * AV1 backend never did. A stale read-cache fits the AV1 partial-decode symptom
+ * (top correct, lower SB-rows -> flat DC). Gated for A/B vs the partial baseline.
+ *   1 = clear CACHE0;  2 = clear CACHE0+1+2 (BSP-style). 0 = off (old behaviour).
+ */
+static int av1_cache_clr;
+module_param(av1_cache_clr, int, 0644);
+MODULE_PARM_DESC(av1_cache_clr, "AV1 clear decoder cache(s) pre-kick (0=off,1=CACHE0,2=all3) — partial-decode probe");
+
+/*
+ * 2026-06-08 Nicolas (lore) follow-up, applied to AV1: dump the intra-above-row
+ * RCB (slot 4 = RCB_INTRA_IN_ROW / reg148) so an ours-vs-MPP content diff is
+ * possible. Unlike H.264's filterd slot (HW output, overwritten), AV1 slot 4 IS
+ * read as INPUT above-row context for SB rows >=1 — exactly where the partial
+ * decode collapses to flat DC — so the buffer state is a genuine suspect here.
+ * Observe-only; logged at run() entry = the PREVIOUS frame's post-decode state.
+ * Compare CRC + first64 against MPP's slot-4 dump on the BSP board for the same
+ * frame; divergence ABOVE the SB row where output goes flat localises the bug.
+ */
+static int av1_rcb_dump;
+module_param(av1_rcb_dump, int, 0644);
+MODULE_PARM_DESC(av1_rcb_dump, "AV1 log post-decode intra RCB (slot 4) CRC32 + first64, observe-only (0=off,1=on)");
+
+/* 2026-06-09 N3 (sequence-diff): wmb()+reg15 readback before the AV1 DEC_E kick
+ * (VP9 has it, AV1 didn't). Default off; A/B against the partial decode. */
+static int av1_kick_barrier;
+module_param(av1_kick_barrier, int, 0644);
+MODULE_PARM_DESC(av1_kick_barrier, "AV1 wmb()+readback before the kick (0=off,1=on) - sequence-diff N3");
+
+/* 2026-06-12 fable review — AV1 metastability isolation probe: mask ALL link
+ * IRQs for the decode (WM16 mask=all, value=0) so no ISR / status ack /
+ * udelay / INT_EN re-arm executes between the kick and the watchdog reap.
+ * Every battery run shows a status=0 IRQ landing INSIDE the decode window
+ * (handler does udelay(100) + INT_EN re-arm mid-decode) — the one per-run-
+ * varying software input every prior lever missed. With this set, the CPU
+ * performs ZERO decoder MMIO between DEC_E and the watchdog read: if the
+ * CDF coin-flip persists it is HW-internal beyond doubt; if it stabilises,
+ * the mid-decode IRQ traffic is implicated. Watchdog DEC_RDY path reaps
+ * (~160 ms/frame) — diagnostic only, default off. */
+static int av1_no_irq;
+module_param(av1_no_irq, int, 0644);
+MODULE_PARM_DESC(av1_no_irq, "AV1 mask all link IRQs; watchdog-only completion (0=off,1=on) - metastability probe");
+
+/* 2026-06-10 — AV1 per-decode metastability probe: a settle delay immediately
+ * before the kick, to test whether the ~50% non-deterministic CDF (clean HW
+ * status, discrete wrong-attractors) is a timing race where the HW samples
+ * buffers/registers before they have settled. Default 0 = no delay. Process
+ * context (run path), so sleeping is fine. */
+static int av1_prekick_settle_us;
+module_param(av1_prekick_settle_us, int, 0644);
+MODULE_PARM_DESC(av1_prekick_settle_us, "AV1 settle delay (us) right before the kick; 0=off");
+
+/* 2026-06-10 — AV1 NEVER flushes the IOMMU TLB (the VP9 path does, via
+ * iommu_flush_iotlb_all gated on iommu_needs_flush; AV1 has no such call). A stale
+ * TLB entry from a prior session's freed mapping is a prime cause of the ~30%
+ * status=0 HW hang (bad fetch). The BSP flushes per-enqueue. Gated A/B test:
+ * 1 = flush iotlb before every AV1 kick. */
+static int av1_tlb_flush;
+module_param(av1_tlb_flush, int, 0644);
+MODULE_PARM_DESC(av1_tlb_flush, "AV1: iommu_flush_iotlb_all before each kick (0=off, 1=on)");
+
+/* 2026-06-10 — the BSP link descriptor (rkvdec2_link_prepare) sets an "error mode
+ * flag" we never set: reg13 |= BIT(18)|BIT(9) and reg12 |= BIT(7) (RKVDEC_WAIT_RESET_EN).
+ * WAIT_RESET_EN should make the HW wait/reset on a transient error instead of hanging —
+ * a candidate for the ~30% status=0 hang. Gated A/B (raw OR before the kick).
+ *   1 = reg12 |= BIT(7) (WAIT_RESET_EN) only
+ *   2 = + reg13 |= BIT(18)|BIT(9) (full BSP error-mode flag) */
+static int av1_errmode;
+module_param(av1_errmode, int, 0644);
+MODULE_PARM_DESC(av1_errmode, "AV1 BSP error-mode flag: 1=reg12 WAIT_RESET_EN, 2=+reg13 bits; 0=off");
+
+/* 2026-06-10 — read back + CRC the full HW register state just before the kick,
+ * split ctrl/params (deterministic) vs address regs (vary). Localizes whether the
+ * ~50% non-determinism is in the registers at all. */
+static int av1_regdump;
+module_param(av1_regdump, int, 0644);
+MODULE_PARM_DESC(av1_regdump, "AV1 dump ctrl_crc/addr_crc of HW regs pre-kick; 0=off");
+
 static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 {
 	struct rkvdec_dev *rkvdec = ctx->dev;
@@ -2625,6 +2943,22 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 
 	if (WARN_ON(!src || !dst))
 		return -EINVAL;
+
+	/* 2026-06-08 observe-only: dump intra-above-row RCB (slot 4) state left by
+	 * the PREVIOUS frame's decode, for the ours-vs-MPP content diff (Nicolas). */
+	if (av1_rcb_dump) {
+		struct rkvdec_rcb_config *rcb = ctx->rcb_config;
+		static unsigned int av1_rcb_run;
+
+		if (rcb && rcb->rcb_count > 4 && rcb->rcb_bufs[4].cpu) {
+			void *p = rcb->rcb_bufs[4].cpu;
+			size_t sz = rcb->rcb_bufs[4].size;
+
+			pr_info("rkvdec-av1 rcb-dump: run_entry=%u slot4(intra) sz=%zu crc=%08x first64=%*ph\n",
+				av1_rcb_run, sz, crc32(0, p, sz), 64, p);
+		}
+		av1_rcb_run++;
+	}
 
 	seq = rkvdec_get_ctrl(ctx, V4L2_CID_STATELESS_AV1_SEQUENCE);
 	fp  = rkvdec_get_ctrl(ctx, V4L2_CID_STATELESS_AV1_FRAME);
@@ -2651,21 +2985,195 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 	/* Pack GBL buffer (Task 8). */
 	vdpu383_av1_config_global_hdr(ctx, seq, fp, fg, av1_ctx, tge, num_tge);
 
-	/* Write address and stride registers (Task 9). */
+	/* Write address and stride registers (Task 9).
+	 *
+	 * Link/CCU mode builds the register set into a CPU image that becomes
+	 * the link descriptor — so the IP runs as a genuine link node and the
+	 * HW performs the per-descriptor completion writeback. (The old
+	 * MMIO-first path drove the IP single-shot, so it completed silently
+	 * with no writeback and the watchdog reset+resend storm recovered each
+	 * frame.) Single-shot writes MMIO exactly as before — img sink NULL.
+	 * See AV1_FAITHFUL_CCU_PORT_PLAN_2026-06-16.md. */
+	u32 reg_image[256] = { 0 };
+	struct av1_reg_sink mmio_sink = { .mmio = rkvdec->regs };
+	struct av1_reg_sink img_sink  = { .image = reg_image };
+	bool link_mode = rkvdec_link_mode && ctx->link_table;
+	const struct av1_reg_sink *sink = link_mode ? &img_sink : &mmio_sink;
+
 	vdpu383_av1_config_addr_regs(ctx, fp, tge, num_tge, src, dst,
 				     av1_ctx, cdf_slot,
-				     is_intra || fp->primary_ref_frame == AV1_PRIMARY_REF_NONE);
+				     is_intra || fp->primary_ref_frame == AV1_PRIMARY_REF_NONE,
+				     sink);
 
 	/* Common-region register setup (block_gating, timeout, error_ctrl,
 	 * dec_mode). Without this the IP block has no clock-gates enabled
 	 * and the trigger goes nowhere — the symptom is "Frame processing
 	 * timed out!" with no IRQ ever firing.
 	 */
-	vdpu383_av1_config_common_regs(ctx);
+	vdpu383_av1_config_common_regs(ctx, sink);
 
 	/* Complete request controls before triggering decode. Mirrors the
 	 * HEVC / VP9 / H.264 backends. */
 	rkvdec_run_postamble(ctx, &run);
+
+	/* 2026-06-08 BSP-infra probe: clear the decoder read-caches pre-kick, as the
+	 * BSP mpp_service and our VP9/H.264 backends do (this AV1 path omitted it).
+	 * 0x41x = function base (= device 0x51x). Gated by av1_cache_clr for A/B. */
+	if (av1_cache_clr >= 1) {
+		writel(0x1u | 0x2u | 0x10u, rkvdec->regs + 0x41c); /* CACHE0_SIZE */
+		if (av1_cache_clr >= 2) {
+			writel(0x1u | 0x2u | 0x10u, rkvdec->regs + 0x45c); /* CACHE1_SIZE */
+			writel(0x1u | 0x2u | 0x10u, rkvdec->regs + 0x49c); /* CACHE2_SIZE */
+		}
+		writel(0x1u, rkvdec->regs + 0x410);                /* CLR_CACHE0 */
+		if (av1_cache_clr >= 2) {
+			writel(0x1u, rkvdec->regs + 0x450);        /* CLR_CACHE1 */
+			writel(0x1u, rkvdec->regs + 0x490);        /* CLR_CACHE2 */
+		}
+		writel(0x1cu, rkvdec->regs + 0x418);               /* MAX_READS */
+		wmb();
+	}
+
+	/* 2026-06-10 E1: flush the cached RCB to device before the kick (no-op
+	 * unless rcb_cached). Mirrors the BSP per-frame dma_sync over its
+	 * dma-buf-cache context buffers — VDPU383_LIFECYCLE_MAP §3.2/3.3. */
+	rkvdec_rcb_sync_for_device(ctx);
+
+	/* 2026-06-10 — read back the full HW register state right before the kick
+	 * and CRC it, split into control/params (reg8-30 + reg64-127, which MUST be
+	 * deterministic run-to-run) vs address regs (reg128-232, legitimately vary
+	 * with buffer allocation). Classify each run via av1_adapt_dump; if ctrl_crc
+	 * is identical between CORRECT and FAILED runs, the non-determinism is NOT in
+	 * the registers (-> buffer/HW state); if it differs, we found the source. */
+	if (av1_regdump) {
+		u32 ctrl[23 + 64], addr[105];
+		int n = 0, r;
+
+		for (r = 8; r <= 30; r++)
+			ctrl[n++] = readl(rkvdec->regs + r * 4);
+		for (r = 64; r <= 127; r++)
+			ctrl[n++] = readl(rkvdec->regs + r * 4);
+		for (r = 128; r <= 232; r++)
+			addr[r - 128] = readl(rkvdec->regs + r * 4);
+
+		pr_info("av1 regdump: ctrl_crc=%08x addr_crc=%08x rcb_slot4=%08x cdf_kf=%08x cdf_wb=%08x strm=%08x decout=%08x\n",
+			crc32(0, ctrl, n * 4), crc32(0, addr, 105 * 4),
+			readl(rkvdec->regs + 148 * 4),   /* RCB slot-4 = intra above-row ctx */
+			readl(rkvdec->regs + 184 * 4),   /* CDF KEY read base */
+			readl(rkvdec->regs + 185 * 4),   /* CDF write-back base */
+			readl(rkvdec->regs + 168 * 4),   /* stream base */
+			readl(rkvdec->regs + 169 * 4));  /* decode-out base (approx) */
+	}
+
+	/* 2026-06-10 AV1: replicate the BSP link descriptor's "error mode flag"
+	 * (rkvdec2_link_prepare): reg12 |= WAIT_RESET_EN, reg13 |= BIT(18)|BIT(9).
+	 * reg12 = offset 0x30, reg13 = offset 0x34. */
+	if (av1_errmode >= 1)
+		writel(readl(rkvdec->regs + 0x30) | BIT(7),
+		       rkvdec->regs + 0x30);
+	if (av1_errmode >= 2)
+		writel(readl(rkvdec->regs + 0x34) | BIT(18) | BIT(9),
+		       rkvdec->regs + 0x34);
+
+	/* 2026-06-10 AV1: flush the IOMMU TLB before the kick (the VP9 path does
+	 * this; AV1 never did). Tests the stale-TLB -> status=0 hang hypothesis. */
+	if (av1_tlb_flush) {
+		struct iommu_domain *dom = iommu_get_domain_for_dev(rkvdec->dev);
+
+		if (dom)
+			iommu_flush_iotlb_all(dom);
+		rkvdec->iommu_needs_flush = false;
+	}
+
+	/* 2026-06-10 AV1 metastability probe: optional pre-kick settle delay. */
+	if (av1_prekick_settle_us > 0)
+		usleep_range(av1_prekick_settle_us, av1_prekick_settle_us + 10);
+
+	/*
+	 * Link/CCU submission (M1, MPP-faithful — AV1_FAITHFUL_CCU_PORT_PLAN).
+	 * The register set was built DIRECTLY into reg_image[] by the config
+	 * functions above (link sink) WITHOUT touching MMIO, so the IP runs as
+	 * a genuine link node off the descriptor and the HW performs the
+	 * per-descriptor completion writeback. (The old path snapshotted live
+	 * MMIO after driving the IP single-shot — it then completed silently
+	 * with no writeback and the watchdog reset+resend storm recovered each
+	 * frame.) Depth=1: job_ready backpressures after one task, so
+	 * cur_cdf_slot / the AV1_FRAME ctrl / DPB advance in done() all still
+	 * reference THIS frame when the reap fires. No batching loop (M2).
+	 */
+	if (link_mode) {
+		u32 slot = av1_ctx->link_table.next_slot;
+		int err;
+
+		rkvdec_link_fill_descriptor(&av1_ctx->link_table, slot, reg_image);
+
+		/* Stash submitting ctx: job_finish-at-submit clears m2m's
+		 * curr_ctx, so the reap (watchdog/IRQ) finds the owner here. */
+		rkvdec->link_ctx = ctx;
+
+		/* No single-shot LINK_INT_EN arm here (fix #2): BSP's link
+		 * enqueue never writes INT_EN — the link IRQ is the raw BIT(9)
+		 * serviced by the link IRQ handler. rkvdec_link_enqueue_vdpu383
+		 * + the watchdog backstop drive completion. */
+
+		/*
+		 * Arm the watchdog as the reap backstop. CRITICAL for AV1: the
+		 * VDPU383 frequently completes an AV1 decode *silently* (clears
+		 * DEC_ENABLE, raises no IRQ). VP9 link mode relies on its IRQ
+		 * firing to drive rkvdec_link_reap_writeback; with no AV1 IRQ the
+		 * threaded handler never runs, so without this the inflight task
+		 * is never reaped and the box wedges in D-state. The watchdog
+		 * link branch (rkvdec.c) then reaps via the per-slot writeback,
+		 * or — for a pure silent completion with no writeback — force-
+		 * ERRORs after a bounded reset+resend budget (guaranteed forward
+		 * progress, no permanent hang). Full 4K timeout, mirroring the
+		 * single-shot path below. If the IRQ does fire first, the reap
+		 * empties the ring and the watchdog bails (inflight_depth==0). */
+		rkvdec_schedule_watchdog(rkvdec, VDPU383_TIMEOUT_4K);
+
+		/* Detach + push BEFORE enqueue (same ordering rule as VP9): the
+		 * HW IRQ can otherwise fire between enqueue and push, leaving the
+		 * reap with an empty inflight ring and a NULL src. */
+		v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+		v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+		err = rkvdec_inflight_push(ctx, src, dst, slot);
+		if (err) {
+			pr_warn_ratelimited("rkvdec-av1: inflight push failed: %d\n",
+					    err);
+			v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
+			v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
+			rkvdec_run_postamble(ctx, &run);
+			v4l2_m2m_job_finish(rkvdec->m2m_dev, ctx->fh.m2m_ctx);
+			return err;
+		}
+
+		err = rkvdec_link_enqueue_vdpu383(&av1_ctx->link_table, slot, 1,
+						  rkvdec->link);
+		av1_ctx->link_table.next_slot =
+			(slot + 1) % av1_ctx->link_table.task_capacity;
+		if (err) {
+			struct rkvdec_link_inflight e = rkvdec_inflight_pop(ctx);
+
+			pr_warn_ratelimited("rkvdec-av1: link enqueue failed: %d\n",
+					    err);
+			if (e.src && e.dst) {
+				v4l2_m2m_buf_done(e.src, VB2_BUF_STATE_ERROR);
+				v4l2_m2m_buf_done(e.dst, VB2_BUF_STATE_ERROR);
+			}
+			rkvdec_run_postamble(ctx, &run);
+			v4l2_m2m_job_finish(rkvdec->m2m_dev, ctx->fh.m2m_ctx);
+			return err;
+		}
+
+		/*
+		 * Finish the m2m job at SUBMIT, not at completion (the link model
+		 * flip). The buffers parked in the inflight ring are returned and
+		 * av1_done() (CDF write-back + DPB advance) is called later by the
+		 * watchdog/IRQ reap; the pm ref device_run took is held until then.
+		 */
+		v4l2_m2m_job_finish(rkvdec->m2m_dev, ctx->fh.m2m_ctx);
+		return 0;
+	}
 
 	/* Arm and trigger the IP block via the link region:
 	 *   1) program timeout threshold
@@ -2673,13 +3181,33 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 	 *   3) raise DEC_E to start decode
 	 */
 	rkvdec_schedule_watchdog(rkvdec, VDPU383_TIMEOUT_4K);
+	/* hw decode-time diagnostic (vp9_time): stamp the single-shot kick so
+	 * the shared DONE-IRQ handler measures pure HW decode time, gst-free. */
+	if (vp9_time)
+		ctx->dev->vp9_kick_kt = ktime_get();
 	/* Session 21: AV1 enables frame-done IRQ only (no LINE_IRQ).
 	 * The ISR clears INT_EN after every IRQ, so we must re-arm on
-	 * every decode trigger. */
-	writel(VDPU383_INT_EN_IRQ | (VDPU383_INT_EN_IRQ << 16),
-	       rkvdec->link + VDPU383_LINK_INT_EN);
+	 * every decode trigger.
+	 *
+	 * av1_no_irq=1 (fable review): mask ALL IRQ bits instead, so the
+	 * decode runs with zero CPU MMIO until the watchdog reap. */
+	if (av1_no_irq)
+		writel(0xffff0000u, rkvdec->link + VDPU383_LINK_INT_EN);
+	else
+		writel(VDPU383_INT_EN_IRQ | (VDPU383_INT_EN_IRQ << 16),
+		       rkvdec->link + VDPU383_LINK_INT_EN);
 	writel(VDPU383_TIMEOUT_4K,  rkvdec->link + VDPU383_LINK_TIMEOUT_THRESHOLD);
 	writel(VDPU383_IP_CRU_MODE, rkvdec->link + VDPU383_LINK_IP_ENABLE);
+
+	/* 2026-06-09 N3 (sequence-diff): the VP9 kick drains posted writes with
+	 * wmb()+reg15 readback before DEC_E; the AV1 path didn't. On weakly-ordered
+	 * ARM the IP could start against partially-landed register/buffer writes.
+	 * Gated for A/B (default off); bake on if it helps the partial decode. */
+	if (av1_kick_barrier) {
+		wmb();
+		readl(rkvdec->regs + VDPU383_OFFSET_COMMON_REGS + 7 * 4);
+	}
+
 	writel(VDPU383_DEC_E_BIT,   rkvdec->link + VDPU383_LINK_DEC_ENABLE);
 
 	return 0;

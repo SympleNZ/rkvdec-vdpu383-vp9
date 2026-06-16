@@ -19,6 +19,8 @@
 #include <linux/string.h>
 
 #include "rkvdec-link.h"
+#include "rkvdec.h"		/* full struct rkvdec_dev for the IRQ-driven warmup */
+#include <linux/jiffies.h>	/* msecs_to_jiffies */
 
 /* Module params live in rkvdec.c. */
 extern int r38_a_core_work_mode;
@@ -855,6 +857,69 @@ int rkvdec_rk3576_warmup_run(void __iomem *link_base, dma_addr_t buf_iova)
 	writel(0x0u, link_base + 0x58);
 
 	if (i >= 200)
+		return -ETIMEDOUT;
+	if (status & 0x3fe)
+		return -EIO;
+	return 0;
+}
+
+/*
+ * 2026-06-08 Variant B — IRQ-driven warmup (Nicolas's lore suggestion: reap by
+ * IRQ, not a manual poll). Same kick sequence as rkvdec_rk3576_warmup_run, but
+ * arms the link IRQ (INT_EN bit0) and sleeps on rkvdec->warmup_irq_done instead
+ * of busy-polling reg 0x4c. The top-level handler (rkvdec_irq_top), guarded by
+ * warmup_irq_inflight, disables INT_EN + completes us. The completion TIMEOUT is
+ * the can't-hang fallback — if the IRQ never arrives we still tear down and
+ * return, exactly like the polled path. Caller: clocks + power must be ON, and
+ * the IRQ must be registered (true at runtime_resume; at probe it may time-out
+ * and fall back, which is harmless).
+ *
+ * Returns 0 on clean IRQ completion, -ETIMEDOUT if the IRQ didn't fire in time
+ * (warmup HW still ran; teardown done), -EIO on HW error status.
+ */
+int rkvdec_rk3576_warmup_run_irq(struct rkvdec_dev *rkvdec)
+{
+	void __iomem *link_base = rkvdec->link;
+	dma_addr_t buf_iova = rkvdec->rk3576_warmup_dma;
+	unsigned long left;
+	u32 status;
+
+	reinit_completion(&rkvdec->warmup_irq_done);
+	rkvdec->warmup_irq_inflight = true;
+
+	writel(0x8000u,      link_base + 0x58); /* ip_en_base, BIT(15) only  */
+	writel(0x7ffffu,     link_base + 0x54); /* ip_time_base watchdog     */
+	writel(0x10001u,     link_base + 0x00); /* mystery init register     */
+	writel(lower_32_bits(buf_iova) + 0x1000u,
+	       link_base + 0x04);               /* CFG_ADDR -> descriptor    */
+	writel(0x1u, link_base + 0x08);         /* LINK_MODE = 1             */
+	writel(0x1u, link_base + 0x18);         /* LINK_EN   = 1             */
+	/* arm ALL link INT_EN bits (write-mask-16: mask=0xffff, val=0xffff) in
+	 * case the warmup completion signals on a bit other than IRQ bit0. */
+	writel(0xffffffffu, link_base + 0x048);
+	dsb(st);
+	dmb(oshst);
+	writel(0x1u, link_base + 0x0c);         /* CFG_DONE -> HW commits    */
+
+	left = wait_for_completion_timeout(&rkvdec->warmup_irq_done,
+					   msecs_to_jiffies(50));
+
+	/* Read status before teardown (handler leaves 0x4c intact). */
+	status = readl(link_base + 0x4c);
+
+	/* If the IRQ never fired, the handler didn't clear inflight — do it. */
+	rkvdec->warmup_irq_inflight = false;
+
+	/* Teardown — identical to the polled path. */
+	writel(0xffff0000u, link_base + 0x48);
+	writel(0xffff0000u, link_base + 0x4c);
+	writel(0x0u, link_base + 0x00);
+	writel(0x0u, link_base + 0x08);
+	writel(0x0u, link_base + 0x18);
+	dmb(oshst);
+	writel(0x0u, link_base + 0x58);
+
+	if (!left)
 		return -ETIMEDOUT;
 	if (status & 0x3fe)
 		return -EIO;

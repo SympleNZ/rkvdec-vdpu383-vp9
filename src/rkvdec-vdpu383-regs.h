@@ -10,6 +10,7 @@
 #define _RKVDEC_VDPU838_REGS_H_
 
 #include <linux/types.h>
+#include <linux/align.h>	/* ALIGN() for vdpu383_fbc_layout() */
 
 #define VDPU383_OFFSET_COMMON_REGS		(8 * sizeof(u32))
 #define VDPU383_OFFSET_CODEC_PARAMS_REGS	(64 * sizeof(u32))
@@ -42,6 +43,48 @@
 #define VDPU383_STA_INT_DEC_RDY_STA	BIT(0)
 #define VDPU383_STA_INT_SOFTRESET_RDY	(BIT(10) | BIT(11))
 #define VDPU383_STA_INT_ALL		0x3ff
+
+/*
+ * FBC (AFBC) CAPTURE-buffer layout for the VDPU383, taken from the MPP H.264
+ * HAL (docs/rk3576/mpp-ref/hal_h264d_vdpu383.c:160,163) for the 8-bit 4:2:0
+ * case only. Single source of truth shared by
+ * rkvdec_fill_decoded_pixfmt() (CAPTURE-buffer sizing) and the codec
+ * config_registers() (register programming) so the two can never disagree.
+ *
+ *   width/height : visible luma dimensions (pixels)
+ *   *head_stride : reg068_hor_virstride value in FBC mode (HAL: fbc_hdr_stride/64)
+ *   *pld_offset  : byte offset of the payload region within the buffer
+ *                  (== size of the FBC header region). Payload base = buf + pld_offset:
+ *                  reg192/reg195 get this added, reg193 gets the offset itself.
+ *   *pixel_size  : total bytes of the FBC pixel region (header + payload) — the
+ *                  linear-sizeimage analogue; colmv goes immediately after it.
+ *
+ * fbc_hdr_stride is taken as ALIGN(width, 64) (64-aligned so reg068 = /64 is exact).
+ * >>> VALIDATE this and the resulting pld_offset against an MPP H.264 FBC register
+ * dump on the BSP board before trusting it on-board: these are the addresses that,
+ * if wrong, IOMMU-fault the decoder (see FBC_THROUGHPUT_PLAN.md footgun note and
+ * memory/vdpu383_h264_silent_hang_test_hazard). 10-bit / 4:2:2 not handled yet. <<<
+ */
+static inline void vdpu383_fbc_layout(u32 width, u32 height,
+				      u32 *head_stride, u32 *pld_offset,
+				      u32 *pixel_size)
+{
+	u32 hdr_stride = ALIGN(width, 64);
+	u32 fbc_h      = ALIGN(height, 64);
+
+	/*
+	 * Taken verbatim from the MPP H.264 HAL (hal_h264d_vdpu383.c:160,163):
+	 *   reg068 = fbc_hdr_stride / 64
+	 *   fbd_offset (reg193) = fbc_hdr_stride * ALIGN(ver_virstride, 64) / 16
+	 * The payload region follows the header region inside the SAME buffer;
+	 * allocate it at the uncompressed 4:2:0 worst case (AFBC never exceeds it)
+	 * so the HW can never overrun the CAPTURE buffer even if a frame compresses
+	 * poorly.
+	 */
+	*head_stride = hdr_stride / 64;
+	*pld_offset  = hdr_stride * fbc_h / 16;			/* AFBC header region */
+	*pixel_size  = *pld_offset + hdr_stride * fbc_h * 3 / 2;	/* + uncompressed payload */
+}
 
 struct vdpu383_regs_common {
 	u32 reg008_dec_mode;

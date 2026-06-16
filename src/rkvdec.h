@@ -15,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/videodev2.h>
 #include <linux/wait.h>
+#include <linux/completion.h>
 #include <linux/clk.h>
 
 #include <media/v4l2-ctrls.h>
@@ -188,13 +189,33 @@ struct rkvdec_dev {
 	bool irq_done_iommu_restore;
 
 	/*
+	 * vdpu383-submit PLAN Phase 1a (rkvdec_submit_mode=2): resident
+	 * kthread worker that owns the link-mode completion (per-slot
+	 * writeback reap) off the threaded-IRQ path. Created at probe,
+	 * destroyed at remove. The hardirq top-half acks the link IRQ and
+	 * kthread_queue_work()s link_reap_work; the worker runs the sleeping
+	 * reap (done()/buf_done/job_finish) in its own process context. NULL
+	 * if worker creation failed (submit_mode=2 then falls back to the
+	 * threaded-IRQ reap, same as mode 0).
+	 */
+	struct kthread_worker *link_worker;
+	struct kthread_work link_reap_work;
+
+	/*
 	 * 2026-06-05 throughput diagnostic (vp9_time module param). Measures
 	 * pure HW decode time (kick -> DONE IRQ) to separate decode rate from
 	 * gst-pipeline overhead. Stamped at the single-shot kick, consumed in
 	 * the DONE IRQ; mean printed every 100 frames. Inert when vp9_time=0.
 	 */
 	ktime_t vp9_kick_kt;
-	u64 vp9_dec_ns_sum;
+	/* Hardirq-arrival stamp (set in the IRQ top-half, overwritten on every
+	 * IRQ so the DONE hardirq wins over any earlier line IRQ). Splits the
+	 * kick->DONE interval into kick->hardirq (pure HW decode) and
+	 * hardirq->threaded (IRQ/scheduling latency) — the decisive
+	 * silicon-vs-driver-overhead measurement. */
+	ktime_t vp9_hardirq_kt;
+	u64 vp9_dec_ns_sum;	/* sum of kick->hardirq (HW decode) */
+	u64 vp9_irq_ns_sum;	/* sum of hardirq->threaded (IRQ latency) */
 	u32 vp9_dec_ns_cnt;
 
 	/*
@@ -324,6 +345,16 @@ struct rkvdec_dev {
 	dma_addr_t  rk3576_warmup_dma;
 
 	/*
+	 * 2026-06-08 Variant B: IRQ-driven warmup (vs the busy-poll in
+	 * rkvdec_rk3576_warmup_run). The warmup arms the link IRQ and waits on
+	 * warmup_irq_done; a guarded branch at the top of vdpu383_irq_handler
+	 * reaps it. warmup_irq_inflight scopes that branch to the warmup window
+	 * so it never touches the decode reap. Gated by the warmup_irq param.
+	 */
+	bool warmup_irq_inflight;
+	struct completion warmup_irq_done;
+
+	/*
 	 * R35 (2026-06-01) — warmup-on-resume counters. Read from telem
 	 * print so we can confirm whether the BSP-parity warmup actually
 	 * fires on the runtime_resume path during a decode session.
@@ -395,6 +426,15 @@ struct rkvdec_ctx {
 	enum rkvdec_image_fmt image_fmt;
 	struct rkvdec_rcb_config *rcb_config;
 	u32 colmv_offset;
+	/*
+	 * FBC (fbc_enable=1, H.264 8-bit NV12 only for now): the payload-region
+	 * offset within the CAPTURE buffer and the reg068 FBC header-stride value.
+	 * Computed once in rkvdec_fill_decoded_pixfmt() (single source of truth),
+	 * consumed by the codec config_registers(). Both 0 when FBC is disabled,
+	 * so the linear path is byte-identical to before.
+	 */
+	u32 fbc_pld_offset;
+	u32 fbc_head_stride;
 	void *priv;
 	/* Phase 2 LINK mode (rkvdec_link_mode=1). Codec start() sets this
 	 * non-NULL when it has allocated a descriptor table; stop() clears

@@ -594,6 +594,8 @@ static void rkvdec_hevc_stop(struct rkvdec_ctx *ctx)
 	kfree(hevc_ctx);
 }
 
+extern int vp9_time;	/* shared HW decode-time diagnostic gate (rkvdec.c) */
+
 static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 {
 	struct rkvdec_dev *rkvdec = ctx->dev;
@@ -626,6 +628,11 @@ static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 
 	timeout_threshold = hevc_ctx->regs.common.reg013_core_timeout_threshold;
 	rkvdec_schedule_watchdog(rkvdec, timeout_threshold);
+
+	/* hw decode-time diagnostic (vp9_time): stamp the single-shot kick so
+	 * the shared DONE-IRQ handler measures pure HW decode time, gst-free. */
+	if (vp9_time)
+		ctx->dev->vp9_kick_kt = ktime_get();
 
 	/* Start decoding! */
 	writel(timeout_threshold, rkvdec->link + VDPU383_LINK_TIMEOUT_THRESHOLD);

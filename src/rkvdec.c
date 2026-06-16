@@ -15,6 +15,7 @@
 #include <linux/genalloc.h>
 #include <linux/interrupt.h>
 #include <linux/iommu.h>
+#include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -84,14 +85,81 @@ MODULE_PARM_DESC(rkvdec_link_depth,
 		 "Link-mode tasks in flight before job_ready backpressures (default 1).");
 
 /*
+ * rkvdec_submit_mode — VDPU383 submit runtime (vdpu383-submit PLAN, Phase 1).
+ *
+ *   0 = single-shot / legacy (default). Completion handling is exactly as
+ *       before: threaded-IRQ inline reap (rkvdec_irq_handler) for link mode,
+ *       or the per-variant single-shot handler.
+ *   2 = kthread-worker link completion. Requires rkvdec_link_mode=1. The
+ *       hardirq top-half acks the link IRQ and wakes a resident kthread
+ *       (rkvdec->link_worker); the worker does the (sleeping) per-slot
+ *       writeback reap out of hardirq/threaded-IRQ context. This is the
+ *       Phase-1a foundation for the MPP-style kthread runtime that removes
+ *       the per-frame threaded-IRQ ms-scale wake on the completion path
+ *       (the throughput ceiling root-caused in SESSION_2026-06-07_h264_linkmode).
+ *
+ * Value 1 is reserved (legacy link == today's rkvdec_link_mode=1 path); the
+ * kthread runtime is selected explicitly with 2 so single-shot and the proven
+ * link path stay byte-for-byte unchanged at the default.
+ */
+int rkvdec_submit_mode;
+module_param(rkvdec_submit_mode, int, 0644);
+MODULE_PARM_DESC(rkvdec_submit_mode,
+		 "VDPU383 submit runtime: 0=single-shot/legacy (default), 2=kthread-worker link completion (needs rkvdec_link_mode=1).");
+
+/*
+ * rkvdec_link_poll — vdpu383-submit PLAN Phase 1b (the throughput lever).
+ *
+ * Only meaningful with rkvdec_submit_mode=2. Default 0 = Phase 1a behaviour
+ * (worker does ONE reap per IRQ wake, then sleeps).
+ *
+ * =1: the worker stays HOT — after reaping completed slots (the reap inline-
+ * feeds the next frame via v4l2_m2m_try_schedule -> device_run), it POLLS the
+ * per-slot writeback for the next completion instead of returning and waiting
+ * for the next IRQ wake. This removes the kthread/threaded wake-from-idle
+ * latency between frames (the "done->next-run gap" that bounds depth>1 below
+ * single-shot — SESSION_2026-06-07_kthread_phase1a measured Phase 1a reap-only
+ * at 88.9 fps == legacy, proving the gap is the per-frame wake, not the reap).
+ * Bounded by a deadline + cpu_relax/cond_resched so a stuck slot falls through
+ * to the fallback watchdog rather than pinning a CPU.
+ */
+int rkvdec_link_poll;
+module_param(rkvdec_link_poll, int, 0644);
+MODULE_PARM_DESC(rkvdec_link_poll,
+		 "Phase 1b: keep the link worker hot — poll for completion + re-feed instead of sleeping between frames (needs rkvdec_submit_mode=2). Default 0.");
+
+/*
  * R35 (2026-06-01) — knob to toggle warmup-on-resume A/B without rebuilding.
  * Default 0 (R23 baseline behaviour: warmup at probe only). Set to 1 to
  * mirror the BSP's rkvdec2_runtime_resume re-warmup.
  */
-int r35_warmup_on_resume;
+int r35_warmup_on_resume = 1;	/* default ON: BSP-faithful rk3576 warmup at
+				 * runtime resume eliminates the VDPU383 H.264
+				 * deblock race (validated 2026-06-06). Set 0 to
+				 * A/B against the un-primed baseline. */
 module_param(r35_warmup_on_resume, int, 0644);
 MODULE_PARM_DESC(r35_warmup_on_resume,
 		 "R35: re-run RK3576 HW warmup on every pm_runtime_resume (0=off/R23, 1=on/BSP-parity)");
+
+/* A/B: disable the RK3576 probe warmup entirely. Added on-board for the
+ * 2026-06-16 AV1 per-module-load pinning investigation (does the H.264-shaped
+ * warmup poison the AV1 metastable state?). Result: NO — warmup_off=1 gives the
+ * same wrong-attractor distribution as warmup-on, so the warmup is not the pin. */
+int warmup_off;
+module_param(warmup_off, int, 0644);
+MODULE_PARM_DESC(warmup_off, "A/B: disable RK3576 warmup entirely (probe+resume) (0=on/default,1=off)");
+
+/*
+ * 2026-06-08 Variant B — IRQ-driven warmup (Nicolas's lore suggestion). When 1,
+ * the warmup arms the link IRQ and sleeps on a completion (reaped by
+ * rkvdec_irq_top) instead of busy-polling reg 0x4c. Default 0 = the validated
+ * polled path. Correctness must be identical (warmup primes the same HW state);
+ * this only changes how completion is detected.
+ */
+int warmup_irq;
+module_param(warmup_irq, int, 0644);
+MODULE_PARM_DESC(warmup_irq,
+		 "Variant B: reap the RK3576 warmup by IRQ instead of busy-poll (0=off/poll, 1=on/IRQ)");
 
 /*
  * R36 (2026-06-01) — warmup on every start_streaming(OUTPUT).
@@ -197,7 +265,32 @@ MODULE_PARM_DESC(irq_split,
 int vp9_time;
 module_param(vp9_time, int, 0644);
 MODULE_PARM_DESC(vp9_time,
-		 "diagnostic: print mean HW decode time (kick->DONE IRQ) every 100 frames (0=off)");
+		 "diagnostic: print mean pure-HW decode time (kick->DONE IRQ) every 100 frames, ALL codecs single-shot (h264/hevc/vp9/av1) — gst-free driver throughput (0=off)");
+
+/*
+ * 2026-06-11 FBC reference-compression throughput probe (increment 1, H.264
+ * 8-bit NV12 only). When set, CAPTURE buffers are laid out in AFBC format and
+ * the decoder writes/reads references compressed (reg009.fbc_e + payload bases),
+ * ~halving reference-read bandwidth (see docs/rk3576/FBC_THROUGHPUT_PLAN.md).
+ * Default 0 = linear (production path, byte-identical to before). Measure the
+ * win via the vp9_time AXI rd_total_bytes counter, FBC on vs off, same stream.
+ * UNVALIDATED on-board: the FBC buffer math can IOMMU-fault if the strides are
+ * wrong — only enable on the dev board with the D-state abort guard.
+ */
+int fbc_enable;
+module_param(fbc_enable, int, 0644);
+MODULE_PARM_DESC(fbc_enable,
+		 "FBC reference-compression probe, H.264 8-bit only: 0=linear (default), 1=AFBC capture buffers + compressed ref reads (UNVALIDATED, dev-board only)");
+
+/*
+ * 2026-06-12 FBC diagnostic: log the FBC address layout (decout/payload offset/
+ * buffer size/colmv + per-ref payload bases) for the first N decodes so a fault
+ * iova from rk_iommu can be correlated against the computed addresses to find the
+ * cold-cache reference-read fault. 0 = off. Set e.g. fbc_log=3 before a decode.
+ */
+int fbc_log;
+module_param(fbc_log, int, 0644);
+MODULE_PARM_DESC(fbc_log, "FBC diagnostic: log address layout for first N decodes (0=off)");
 
 /*
  * 2026-06-05 throughput fix override. The single-shot kick used to flush the
@@ -252,6 +345,16 @@ MODULE_PARM_DESC(r44_dump_altref_regs,
  * AXI buffers) from prior decodes. Hypothesis: soft-reset HW IP
  * before each alt-ref decode to clear that residual state.
  */
+/* 2026-06-10 — full IOMMU HW refresh before each decode, mirroring the BSP service's
+ * mpp_iommu_refresh (rockchip_iommu_disable+enable). Mainline equivalent: the empty-domain
+ * dance (rkvdec_iommu_restore = attach empty domain -> reprogram DTE -> detach -> restore
+ * default) + an explicit iotlb flush. Tests the stale-IOMMU-HW-state hypothesis for the AV1/VP9
+ * non-determinism (stronger than the iotlb-flush alone, which was negative). 0=off. */
+int iommu_refresh_per_decode;
+module_param(iommu_refresh_per_decode, int, 0644);
+MODULE_PARM_DESC(iommu_refresh_per_decode,
+		 "Full IOMMU HW refresh (empty-domain DTE reprogram + flush) before each decode; 0=off");
+
 int r45_reset_before_altref;
 module_param(r45_reset_before_altref, int, 0644);
 MODULE_PARM_DESC(r45_reset_before_altref,
@@ -545,6 +648,25 @@ static void rkvdec_fill_decoded_pixfmt(struct rkvdec_ctx *ctx,
 			 * half that (interleaved at half vertical resolution). */
 			pix_mp->plane_fmt[0].sizeimage = aligned_bpl * height * 3 / 2;
 		}
+	}
+
+	/*
+	 * FBC probe (fbc_enable=1, increment 1): replace the linear pixel-region
+	 * size with the AFBC header+payload layout; colmv then follows it. Only
+	 * H.264 config_registers() actually programs fbc_e — other codecs would
+	 * just get an over-sized (still linear) buffer here, which is safe (no
+	 * overrun), only wasteful. Default-off path is untouched.
+	 */
+	ctx->fbc_pld_offset = 0;
+	ctx->fbc_head_stride = 0;
+	if (fbc_enable && pix_mp->pixelformat == V4L2_PIX_FMT_NV12) {
+		u32 head_stride, pld_offset, pixel_size;
+
+		vdpu383_fbc_layout(pix_mp->width, pix_mp->height,
+				   &head_stride, &pld_offset, &pixel_size);
+		ctx->fbc_head_stride = head_stride;
+		ctx->fbc_pld_offset = pld_offset;
+		pix_mp->plane_fmt[0].sizeimage = pixel_size;
 	}
 
 	ctx->colmv_offset = pix_mp->plane_fmt[0].sizeimage;
@@ -1768,6 +1890,35 @@ static void rkvdec_stop_streaming(struct vb2_queue *q)
 			 ctx->dev->accum_suspended_at_stop_out,
 			 ctx->dev->accum_suspended_at_vp9_stop);
 
+		/* vp9_time diagnostic: flush any partial HW-timing accumulation
+		 * (streams shorter than the 100-frame print threshold, or with
+		 * many show-existing/alt-ref frames that don't fire a decode IRQ,
+		 * otherwise never report). */
+		if (vp9_time && ctx->dev->vp9_dec_ns_cnt) {
+			u32 n = ctx->dev->vp9_dec_ns_cnt;
+
+			dev_info(ctx->dev->dev,
+				 "vp9_time flush: HWdecode=%llu us IRQlat=%llu us total=%llu us/frame over %u decodes\n",
+				 ctx->dev->vp9_dec_ns_sum / n / 1000,
+				 ctx->dev->vp9_irq_ns_sum / n / 1000,
+				 (ctx->dev->vp9_dec_ns_sum +
+				  ctx->dev->vp9_irq_ns_sum) / n / 1000, n);
+			ctx->dev->vp9_dec_ns_sum = 0;
+			ctx->dev->vp9_irq_ns_sum = 0;
+			ctx->dev->vp9_dec_ns_cnt = 0;
+		}
+
+		/*
+		 * vdpu383-submit Phase 1a: drain any pending link-completion
+		 * reap before the codec stop() tears down ctx->link_table, so a
+		 * worker reap can't touch a freed table. No-op when the worker
+		 * was never used (submit_mode!=2). The watchdog is
+		 * cancel_delayed_work_sync'd at remove; here job_abort has
+		 * already forced inflight to error-complete via the m2m path.
+		 */
+		if (ctx->dev->link_worker)
+			kthread_flush_work(&ctx->dev->link_reap_work);
+
 		if (desc->ops->stop)
 			desc->ops->stop(ctx);
 
@@ -1987,6 +2138,13 @@ static bool rkvdec_link_pop_if_done(struct rkvdec_ctx *ctx,
 		 * (yt INTER/alt-ref intermittently err-writebacks; without this
 		 * the err frame is reaped ERROR -> gst flow-error -5.)
 		 * wb==0 / sentinel = not finished yet -> also left in flight.
+		 *
+		 * NB (2026-06-07): bit 2 (0xf0000004) writebacks are NOT benign in
+		 * link depth>1 — they are PARTIAL frames the mid-decode append
+		 * disturbed; the watchdog reset+RESEND re-decodes them correctly.
+		 * So bit 2 stays in the error test (reaping it hands a partial
+		 * frame to userspace). The real fix is to avoid the append entirely
+		 * (batch-only), not to reap partials.
 		 */
 		if (wb != 0 && wb != 0xffffffffu &&
 		    !(wb & ctx->link_table->info->err_mask)) {
@@ -2020,11 +2178,83 @@ static u32 rkvdec_link_reap_writeback(struct rkvdec_ctx *ctx)
 	}
 
 	if (reaped) {
+		u32 left = rkvdec_inflight_depth(ctx);
+
 		ctx->link_resets = 0;	/* progress -> refresh reset budget */
 		cancel_delayed_work(&rkvdec->watchdog_work);
+		/*
+		 * 2026-06-07 depth>1: if tasks remain in flight (e.g. appended
+		 * frames whose completion hasn't landed yet), keep a fallback
+		 * watchdog so a missed IRQ on them can't strand the ring. Without
+		 * this the cancel above left the remainder with no reaper.
+		 */
+		if (left) {
+			ctx->watchdog_poll_count = 0;
+			schedule_delayed_work(&rkvdec->watchdog_work,
+				msecs_to_jiffies(RKVDEC_WATCHDOG_POLL_MS));
+		}
+		pr_debug("rkvdec link-reap: reaped=%u left=%u\n", reaped, left);
 		v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
 	}
 	return reaped;
+}
+
+/*
+ * vdpu383-submit PLAN Phase 1a (rkvdec_submit_mode=2): kthread-worker link
+ * completion. The hardirq top-half (rkvdec_irq_top) acks the link IRQ and
+ * kthread_queue_work()s this; here, in the resident worker's process context,
+ * we run the (sleeping) per-slot writeback reap. This relocates the reap off
+ * the threaded-IRQ path — bit-for-bit the same reap the threaded handler did,
+ * just owned by a resident kthread. It is the first step of the MPP-style
+ * kthread runtime that removes the per-frame threaded-IRQ ms-scale wake on the
+ * completion path (the throughput ceiling from SESSION_2026-06-07_h264_linkmode).
+ *
+ * Single owner: link_ctx is the stashed completion-owner ctx (single-stream
+ * endpoint — one ctx in flight at a time, same assumption the watchdog and
+ * threaded handler already make).
+ */
+static void rkvdec_link_reap_work_fn(struct kthread_work *work)
+{
+	struct rkvdec_dev *rkvdec =
+		container_of(work, struct rkvdec_dev, link_reap_work);
+	struct rkvdec_ctx *ctx = rkvdec->link_ctx;
+	unsigned long deadline;
+	u32 spins = 0;
+
+	if (!ctx || !ctx->link_table)
+		return;
+
+	if (!rkvdec_link_poll) {
+		/* Phase 1a: one reap per IRQ wake, then sleep. */
+		rkvdec_link_reap_writeback(ctx);
+		return;
+	}
+
+	/*
+	 * Phase 1b: keep the worker hot. rkvdec_link_reap_writeback reaps every
+	 * completed slot AND inline-feeds the next frame (its tail
+	 * v4l2_m2m_try_schedule runs device_run synchronously in this context).
+	 * Rather than return after one reap and pay the wake-from-idle latency
+	 * before the next frame, poll the per-slot writeback until HW drains —
+	 * so HW is re-armed the instant a slot frees. Bounded by a 250 ms
+	 * deadline + cpu_relax/cond_resched: a genuinely stuck slot exits the
+	 * loop and the fallback watchdog (armed by run() under lineirq) recovers
+	 * it, and other tasks (gst) still get the CPU.
+	 */
+	deadline = jiffies + msecs_to_jiffies(250);
+	do {
+		u32 reaped = rkvdec_link_reap_writeback(ctx);
+
+		if (rkvdec_inflight_depth(ctx) == 0)
+			break;		/* nothing in flight -> truly idle */
+		if (reaped) {
+			spins = 0;
+		} else {
+			cpu_relax();
+			if ((++spins & 0x3ff) == 0)
+				cond_resched();
+		}
+	} while (time_before(jiffies, deadline));
 }
 
 static void rkvdec_iommu_restore(struct rkvdec_dev *rkvdec);
@@ -2356,6 +2586,16 @@ static void rkvdec_device_run(void *priv)
 		}
 	}
 
+	/* 2026-06-10: gated full IOMMU HW refresh (mpp_iommu_refresh equivalent). */
+	if (iommu_refresh_per_decode) {
+		struct iommu_domain *dom;
+
+		rkvdec_iommu_restore(rkvdec);
+		dom = iommu_get_domain_for_dev(rkvdec->dev);
+		if (dom)
+			iommu_flush_iotlb_all(dom);
+	}
+
 	ret = desc->ops->run(ctx);
 	if (ret)
 		rkvdec_job_finish(ctx, VB2_BUF_STATE_ERROR);
@@ -2399,6 +2639,21 @@ static void rkvdec_job_abort(void *priv)
 static int rkvdec_job_ready(void *priv)
 {
 	struct rkvdec_ctx *ctx = priv;
+
+	/*
+	 * vdpu383-submit Phase 1b: batch-when-idle. In kthread mode
+	 * (rkvdec_submit_mode=2) only let m2m dispatch device_run when HW is
+	 * fully idle (inflight==0). device_run then batches every currently-
+	 * ready frame into ONE bootstrap kick (frame_num=N), so HW never gets a
+	 * mid-decode ADD_MODE append — which is what disturbed in-flight frames
+	 * into partials and forced the watchdog reset+resend recovery that
+	 * dominated the depth>1 throughput gap (SESSION_2026-06-07_kthread_phase1a:
+	 * 14 resets / 600 frames, ~half the 89→160 fps gap). No append => no
+	 * partials => no resends. (depth>2 batched still hits the IP ring-walk
+	 * limit, a separate issue.)
+	 */
+	if (rkvdec_submit_mode == 2 && rkvdec_link_mode && ctx->link_table)
+		return rkvdec_inflight_depth(ctx) == 0 ? 1 : 0;
 
 	if (rkvdec_link_mode && ctx->link_table &&
 	    rkvdec_inflight_depth(ctx) >= (u32)rkvdec_link_depth)
@@ -2940,18 +3195,56 @@ static irqreturn_t vdpu383_irq_handler(struct rkvdec_ctx *ctx)
 		 * for single-shot; the silent-completion is then
 		 * link-mode-specific. */
 		rkvdec->telem_irq_done_clean++;
-		/* vp9_time diagnostic: pure HW decode time (kick->this DONE). */
+		/*
+		 * vp9_time diagnostic: split the kick->DONE interval into
+		 * kick->hardirq (pure HW decode) and hardirq->threaded (IRQ +
+		 * scheduler wake latency). This is the decisive
+		 * silicon-vs-driver-overhead measurement: if HW decode is small
+		 * and IRQ latency is large, the single-shot throughput gap vs MPP
+		 * is removable driver overhead, not silicon.
+		 */
 		if (vp9_time && rkvdec->vp9_kick_kt) {
-			rkvdec->vp9_dec_ns_sum += ktime_to_ns(
-				ktime_sub(ktime_get(), rkvdec->vp9_kick_kt));
+			ktime_t now = ktime_get();
+			u64 hw_ns = rkvdec->vp9_hardirq_kt ?
+				ktime_to_ns(ktime_sub(rkvdec->vp9_hardirq_kt,
+						      rkvdec->vp9_kick_kt)) :
+				ktime_to_ns(ktime_sub(now, rkvdec->vp9_kick_kt));
+			u64 lat_ns = rkvdec->vp9_hardirq_kt ?
+				ktime_to_ns(ktime_sub(now,
+						      rkvdec->vp9_hardirq_kt)) : 0;
+
+			rkvdec->vp9_dec_ns_sum += hw_ns;
+			rkvdec->vp9_irq_ns_sum += lat_ns;
 			if (++rkvdec->vp9_dec_ns_cnt >= 100) {
-				pr_info("rkvdec-vp9: HW decode mean=%llu us/frame over %u\n",
-					rkvdec->vp9_dec_ns_sum /
-						rkvdec->vp9_dec_ns_cnt / 1000,
-					rkvdec->vp9_dec_ns_cnt);
+				u32 n = rkvdec->vp9_dec_ns_cnt;
+				/*
+				 * 2026-06-07 memory-bound probe: read the AXI perf
+				 * counters (reg322-325 @ 0x508-0x514) for THIS decode.
+				 * rd_total_bytes = bytes read over AXI (ref + stream);
+				 * avg/max_lat = read latency in counter ticks. High
+				 * bytes + high latency => memory-bandwidth-bound; compare
+				 * rd_total_bytes vs MPP (FBC would roughly halve it).
+				 * Enabled only when vp9_time set (config_registers).
+				 */
+				u32 rd_maxlat = readl(rkvdec->regs + 0x508);
+				u32 rd_samp   = readl(rkvdec->regs + 0x50c);
+				u32 rd_accsum = readl(rkvdec->regs + 0x510);
+				u32 rd_bytes  = readl(rkvdec->regs + 0x514);
+
+				pr_info("rkvdec: HWdecode=%llu us IRQlat=%llu us total=%llu us/frame over %u\n",
+					rkvdec->vp9_dec_ns_sum / n / 1000,
+					rkvdec->vp9_irq_ns_sum / n / 1000,
+					(rkvdec->vp9_dec_ns_sum +
+					 rkvdec->vp9_irq_ns_sum) / n / 1000, n);
+				pr_info("rkvdec: perf rd_total_bytes=%u avg_lat=%u max_lat=%u samp=%u (last frame)\n",
+					rd_bytes, rd_samp ? rd_accsum / rd_samp : 0,
+					rd_maxlat, rd_samp);
 				rkvdec->vp9_dec_ns_sum = 0;
+				rkvdec->vp9_irq_ns_sum = 0;
 				rkvdec->vp9_dec_ns_cnt = 0;
 			}
+			rkvdec->vp9_kick_kt = 0;
+			rkvdec->vp9_hardirq_kt = 0;
 		}
 	} else if (status & VDPU383_INT_EN_LINE_IRQ) {
 		/* Line interrupt fired before frame-done: decode still running.
@@ -3103,6 +3396,53 @@ static irqreturn_t rkvdec_irq_top(int irq, void *priv)
 {
 	struct rkvdec_dev *rkvdec = priv;
 	struct rkvdec_ctx *ctx;
+
+	/*
+	 * 2026-06-08 Variant B: IRQ-driven warmup reap. The warmup runs with NO
+	 * decode job/ctx (probe / runtime_resume), so it must be caught HERE in the
+	 * top-level handler, before any ctx lookup. Disable the link IRQ (WM16 clear
+	 * of INT_EN bit0) so it can't re-fire, leave the 0x4c status for
+	 * warmup_run_irq to read, and wake it. Scoped by warmup_irq_inflight so it
+	 * never touches the decode reap. Hardirq-safe (MMIO + complete()).
+	 */
+	if (rkvdec->warmup_irq_inflight) {
+		writel(0xffff0000u, rkvdec->link + 0x048); /* WM16: mask=all, val=0 */
+		rkvdec->warmup_irq_inflight = false;
+		complete(&rkvdec->warmup_irq_done);
+		return IRQ_HANDLED;
+	}
+
+	/*
+	 * vp9_time diagnostic: stamp the hardirq arrival so the threaded DONE
+	 * handler can split kick->hardirq (pure HW decode time) from
+	 * hardirq->threaded (IRQ delivery + scheduler wake latency). Overwrite
+	 * on every IRQ so the final (DONE) hardirq wins over any earlier line
+	 * IRQ. Gated on vp9_kick_kt (set only between a kick and its DONE).
+	 */
+	if (vp9_time && rkvdec->vp9_kick_kt)
+		rkvdec->vp9_hardirq_kt = ktime_get();
+
+	/*
+	 * vdpu383-submit Phase 1a (rkvdec_submit_mode=2): kthread-worker link
+	 * completion. Ack the link IRQ here in the hardirq top-half — the SAME
+	 * WM16 clear (0xffff0000 to irq_base 0x48 + status_base 0x4c) the
+	 * threaded link handler does, MMIO-only and hardirq-safe — then wake the
+	 * resident worker to run the sleeping per-slot reap. Returning
+	 * IRQ_HANDLED skips the threaded handler so its inline reap doesn't also
+	 * run. Falls through (untouched) if the worker is absent or there's no
+	 * link ctx in flight.
+	 */
+	if (rkvdec_submit_mode == 2 && rkvdec_link_mode && rkvdec->link_worker) {
+		struct rkvdec_ctx *lctx = rkvdec->link_ctx;
+
+		if (lctx && lctx->link_table) {
+			writel(0xffff0000u, rkvdec->link + 0x48);
+			writel(0xffff0000u, rkvdec->link + 0x4c);
+			kthread_queue_work(rkvdec->link_worker,
+					   &rkvdec->link_reap_work);
+			return IRQ_HANDLED;
+		}
+	}
 
 	if (!irq_split)
 		return IRQ_WAKE_THREAD;
@@ -3468,9 +3808,14 @@ static void rkvdec_watchdog_func(struct work_struct *work)
 					 * → -64 vector LM regression on 03-size.
 					 */
 					u32 completed =
+						ctx->link_table ?
 						rkvdec_link_check_completion(
 							ctx->link_table,
-							rkvdec->link);
+							rkvdec->link) : 1;
+					/* Single-shot (AV1/HEVC/H264) has no link table;
+					 * completed=1 -> genuine silent completion. The
+					 * link calls below NULL-deref in single-shot and
+					 * oops the watchdog worker (AV1 D-state hang). */
 					/*
 					 * 2026-05-31 Round 12 v2 telemetry:
 					 * classify each silent_completion by what
@@ -3481,8 +3826,9 @@ static void rkvdec_watchdog_func(struct work_struct *work)
 					 * design.
 					 */
 					{
-						u32 ts = rkvdec_link_read_task_status(
-							ctx->link_table, 0);
+						u32 ts = ctx->link_table ?
+							rkvdec_link_read_task_status(
+								ctx->link_table, 0) : 0;
 						bool wb = (ts != 0xffffffffu) &&
 							  (ts != 0);
 						bool err_bits = wb && (ts & 0x3feu);
@@ -3627,10 +3973,43 @@ static void rkvdec_watchdog_func(struct work_struct *work)
 		 * Single-shot: the classic finish (pm_put + buf_done +
 		 * job_finish) — unchanged.
 		 */
-		if (rkvdec_link_mode && ctx->link_table)
-			rkvdec_link_reap(ctx, state);
-		else
+		if (rkvdec_link_mode && ctx->link_table) {
+			if ((u32)rkvdec_link_depth > 1) {
+				/*
+				 * 2026-06-07 depth>1 completion. The global
+				 * DEC_RDY_STA bit + whole-ring rkvdec_link_reap
+				 * returns EVERY in-flight buffer the instant ANY
+				 * frame signals done, so a later frame HW is still
+				 * writing gets captured half-decoded (observed:
+				 * frame correct to ~row 588, rest zero). Instead reap
+				 * ONLY slots whose own per-slot writeback (tb_reg_int)
+				 * is set, and leave the rest in flight + re-poll, so a
+				 * frame is never returned before HW finished it.
+				 * Bounded by the reset budget so a genuinely stuck
+				 * slot can't stall forever.
+				 */
+				u32 reaped = rkvdec_link_reap_writeback(ctx);
+				u32 left = rkvdec_inflight_depth(ctx);
+
+				pr_info_ratelimited("rkvdec h264-link d>1: reaped=%u left=%u resets=%u\n",
+						    reaped, left, ctx->link_resets);
+				if (left > 0) {
+					if (++ctx->link_resets < RKVDEC_MAX_LINK_RESETS) {
+						rkvdec_schedule_watchdog_poll(rkvdec);
+					} else {
+						rkvdec_link_quiesced_reset(rkvdec, ctx);
+						rkvdec_link_reap(ctx, VB2_BUF_STATE_ERROR);
+						ctx->link_resets = 0;
+					}
+				} else {
+					ctx->link_resets = 0;
+				}
+			} else {
+				rkvdec_link_reap(ctx, state);
+			}
+		} else {
 			rkvdec_job_finish(ctx, state);
+		}
 	}
 }
 
@@ -3875,6 +4254,10 @@ static int rkvdec_probe(struct platform_device *pdev)
 	 * irq_split experiment is off, so behaviour is identical to the old
 	 * NULL-primary registration); threaded = rkvdec_irq_handler.
 	 */
+	/* 2026-06-08 Variant B: init the IRQ-driven-warmup completion before the
+	 * IRQ goes live (warmup_irq_inflight is already false via kzalloc). */
+	init_completion(&rkvdec->warmup_irq_done);
+
 	ret = devm_request_threaded_irq(&pdev->dev, irq, rkvdec_irq_top,
 					rkvdec_irq_handler, IRQF_ONESHOT,
 					dev_name(&pdev->dev), rkvdec);
@@ -3882,6 +4265,26 @@ static int rkvdec_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(&pdev->dev, "Could not request vdec IRQ\n");
 		return ret;
+	}
+
+	/*
+	 * vdpu383-submit Phase 1a: resident kthread worker for link-mode
+	 * completion (rkvdec_submit_mode=2). VDPU383-only (the sole variant with
+	 * link mode). Best-effort: on failure link_worker stays NULL and
+	 * submit_mode=2 transparently falls back to the threaded-IRQ reap.
+	 */
+	if (rkvdec->variant == &vdpu383_variant && rkvdec->link) {
+		kthread_init_work(&rkvdec->link_reap_work,
+				  rkvdec_link_reap_work_fn);
+		rkvdec->link_worker =
+			kthread_create_worker(0, "rkvdec-link/%s",
+					      dev_name(&pdev->dev));
+		if (IS_ERR(rkvdec->link_worker)) {
+			dev_warn(&pdev->dev,
+				 "link kthread worker create failed: %ld (submit_mode=2 unavailable)\n",
+				 PTR_ERR(rkvdec->link_worker));
+			rkvdec->link_worker = NULL;
+		}
 	}
 
 	rkvdec->sram_pool = of_gen_pool_get(pdev->dev.of_node, "sram", 0);
@@ -3927,7 +4330,7 @@ static int rkvdec_probe(struct platform_device *pdev)
 	 * rk3328, rk3568, rk3588 = vdpu381) use different IP blocks that
 	 * don't need this workaround.
 	 */
-	if (rkvdec->variant == &vdpu383_variant && rkvdec->link) {
+	if (rkvdec->variant == &vdpu383_variant && rkvdec->link && !warmup_off) {
 		int rc;
 
 		ret = pm_runtime_resume_and_get(&pdev->dev);
@@ -3950,7 +4353,9 @@ static int rkvdec_probe(struct platform_device *pdev)
 			goto warmup_skip;
 		}
 
-		rc = rkvdec_rk3576_warmup_run(rkvdec->link,
+		rc = warmup_irq ?
+		     rkvdec_rk3576_warmup_run_irq(rkvdec) :
+		     rkvdec_rk3576_warmup_run(rkvdec->link,
 					      rkvdec->rk3576_warmup_dma);
 		if (rc == 0) {
 			dev_info(&pdev->dev,
@@ -4083,6 +4488,12 @@ static void rkvdec_remove(struct platform_device *pdev)
 	cancel_delayed_work_sync(&rkvdec->watchdog_work);
 	cancel_work_sync(&rkvdec->irq_done_work); /* irq_split bottom-half */
 
+	/* vdpu383-submit Phase 1a: tear down the link completion worker. */
+	if (rkvdec->link_worker) {
+		kthread_destroy_worker(rkvdec->link_worker);
+		rkvdec->link_worker = NULL;
+	}
+
 	rkvdec_v4l2_cleanup(rkvdec);
 	pm_runtime_disable(&pdev->dev);
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
@@ -4143,7 +4554,9 @@ static int rkvdec_runtime_resume(struct device *dev)
 	if (r35_warmup_on_resume &&
 	    rkvdec->variant == &vdpu383_variant &&
 	    rkvdec->link && rkvdec->rk3576_warmup_cpu) {
-		int rc = rkvdec_rk3576_warmup_run(rkvdec->link,
+		int rc = warmup_irq ?
+			 rkvdec_rk3576_warmup_run_irq(rkvdec) :
+			 rkvdec_rk3576_warmup_run(rkvdec->link,
 						  rkvdec->rk3576_warmup_dma);
 		rkvdec->r35_resume_warmups++;
 		if (rc == 0)

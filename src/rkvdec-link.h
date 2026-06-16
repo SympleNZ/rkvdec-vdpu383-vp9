@@ -282,6 +282,15 @@ void rkvdec_rk3576_warmup_free(struct device *dev,
 int rkvdec_rk3576_warmup_run(void __iomem *link_base, dma_addr_t buf_iova);
 
 /*
+ * 2026-06-08 Variant B — IRQ-driven warmup. Arms the link IRQ and sleeps on
+ * rkvdec->warmup_irq_done (reaped by rkvdec_irq_top under warmup_irq_inflight)
+ * instead of busy-polling. The completion timeout is the can't-hang fallback.
+ * Returns 0 / -ETIMEDOUT (IRQ didn't fire; HW still ran) / -EIO.
+ */
+struct rkvdec_dev;
+int rkvdec_rk3576_warmup_run_irq(struct rkvdec_dev *rkvdec);
+
+/*
  * Enqueue ONE filled descriptor into the link queue. Implements BSP's
  * rkvdec2_link_enqueue (mpp_rkvdec2_link.c:476) including the first-
  * task-of-session bootstrap (cache clear + LINK_EN bring-up) and

@@ -13,6 +13,7 @@
  * requirement, which individual writel() calls do not satisfy.
  */
 
+#include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/hw_bitfield.h>
 #include <linux/io.h>
@@ -35,6 +36,7 @@
 
 extern int rkvdec_link_mode;
 extern int r43_invalidate_probs_on_fail;
+extern int rcb_sram_pack;	/* rcb.c: per-region SRAM packing (N1 follow-up) */
 extern int r44_dump_altref_regs;
 extern int r45_reset_before_altref;
 extern int r49_pre_mv_carryforward;
@@ -53,6 +55,33 @@ int vp9_dump_ctrls;
 module_param(vp9_dump_ctrls, int, 0644);
 MODULE_PARM_DESC(vp9_dump_ctrls,
 		 "Dump v4l2_ctrl_vp9_frame per frame to dmesg as hex (link-mode client capture).");
+
+/* 2026-06-12 fable review: stream-tail sensitivity probe for the tiny-frame
+ * partial-decode failure (yt overlay / 35 B skip frames). See the pad block
+ * in vdpu383_vp9_build_regs(). 0=off, 1=re-zero pad + cache clean,
+ * 2=poison pad 0xAA + cache clean. */
+static int vp9_tail_dbg;
+module_param(vp9_tail_dbg, int, 0644);
+MODULE_PARM_DESC(vp9_tail_dbg,
+		 "VP9 stream-tail probe: 0=off 1=zero+sync 2=poison+sync (diagnostic)");
+
+/* 2026-06-12 fable review: the Bug-A tiny-frame (<512 B) LINK_TIMEOUT
+ * override — historic value 500000 cycles. The refs-bypassed decode mode's
+ * boundary is exactly this <512 B condition; 0 disables the override
+ * entirely (resolution-based threshold for every frame). */
+static int vp9_tiny_timeout = 500000;
+module_param(vp9_tiny_timeout, int, 0644);
+MODULE_PARM_DESC(vp9_tiny_timeout,
+		 "LINK_TIMEOUT_THRESHOLD override (cycles) for <512B frames; 0=no override (default 500000 = legacy)");
+
+/* 2026-06-12 fable review: arm INT_EN LINE_IRQ (bit1) alongside bit0 at the
+ * single-shot kick, matching the BSP's per-task irq_mask 0x30000. Tests
+ * whether the line-IRQ enable is load-bearing for the tiny-frame
+ * refs-bypass. Default off. */
+static int vp9_int_lineirq;
+module_param(vp9_int_lineirq, int, 0644);
+MODULE_PARM_DESC(vp9_int_lineirq,
+		 "Arm INT_EN bits 0+1 (BSP irq_mask) at VP9 kick (0=off,1=on) - diagnostic");
 
 /*
  * 2026-06-04: clear all THREE decoder caches (CACHE0/1/2) like the BSP
@@ -122,6 +151,60 @@ int vp9_perturb_refs;
 module_param(vp9_perturb_refs, int, 0644);
 MODULE_PARM_DESC(vp9_perturb_refs,
 		 "Redirect non-alt compound ref legs to a 0x00 scratch buffer for the displayed compound frame (H1/H2 probe). 1=on.");
+
+/*
+ * Cat 5.1 — IOMMU access trace (2026-06-09). The rockchip IOMMU logs only
+ * page FAULTS, not successful translations, so we cannot passively watch what
+ * the HW fetches. This turns "does the HW fetch the last/golden legs of the
+ * compound frame?" into a binary fault signal: point reg170/171 (+payload
+ * reg195/196) at a deliberately UNMAPPED IOVA sentinel for the displayed
+ * compound frame, alt (reg172/197) left intact.
+ *   - rk_iommu page fault at the sentinel -> HW DID issue reads to last/golden
+ *     -> compound combine/weight is the broken stage, not the fetch.
+ *   - NO fault, decode proceeds (single-ref-alt) -> HW never fetches the second
+ *     leg -> compound is dead at the bus level inside the HW.
+ * Strictly stronger than vp9_perturb_refs (a read-into-discard could defeat the
+ * content perturb; an unmapped IOVA cannot be read silently). Default off.
+ */
+int vp9_iova_fault;
+module_param(vp9_iova_fault, int, 0644);
+MODULE_PARM_DESC(vp9_iova_fault,
+		 "Point compound last/golden legs at UNMAPPED IOVA sentinels to fault-trace HW ref fetches (Cat 5.1). 1=on.");
+
+/*
+ * Cat 6.1 reserved-register-bit sweep (2026-06-09). OR a mask into a common
+ * control register (index relative to reg008) on the displayed compound frame,
+ * immediately before the kick. Purpose: surface an UNDOCUMENTED control bit a
+ * value-diff cannot see — MPP sets the same *named* bits we do (Cat 1 matched),
+ * so a reserved bit MPP never touches is invisible to any input comparison.
+ * Signal: vp9_adapt_dump's adapted comp_mode@116 / whole-prob CRC. Baseline is
+ * static (HW decodes single-ref, compound never engages); a fuzz bit that MOVES
+ * comp_mode@116 or the CRC affects compound decoding → candidate fix lever.
+ * Default off (reg index -1). reg009_important_en = index 1 (the prime target).
+ */
+static int vp9_regfuzz_reg = -1;
+module_param(vp9_regfuzz_reg, int, 0644);
+MODULE_PARM_DESC(vp9_regfuzz_reg, "Cat6.1: common-reg index rel reg008 to OR-fuzz on the compound frame; -1=off");
+static uint vp9_regfuzz_or;
+module_param(vp9_regfuzz_or, uint, 0644);
+MODULE_PARM_DESC(vp9_regfuzz_or, "Cat6.1: 32-bit mask OR'd into the vp9_regfuzz_reg register before kick");
+
+/*
+ * 2026-06-08 compound "why" probe: the perturb test proved compound doesn't
+ * ENGAGE (HW uses alt-only) but not WHY. The HW writes its post-decode adapted
+ * probability state to probs[frame_context_idx] (reg185) — and the adapted
+ * comp_mode/comp_ref/single_ref probs encode which modes HW actually DECODED.
+ * Dump that buffer (CRC + first96 + refmode) post-decode and compare ours-vs-MPP
+ * for the failing compound frame (refmode=2=SELECT):
+ *   - adapted probs == MPP -> HW decoded the SAME modes (incl compound) yet our
+ *     output collapses -> compound EXECUTION erratum (silicon; sharpest evidence).
+ *   - adapted probs differ -> HW decoded the modes differently -> the entropy
+ *     decode / context is the cause (potentially ours; the "missed" thing).
+ * Observe-only, default off.
+ */
+static int vp9_adapt_dump;
+module_param(vp9_adapt_dump, int, 0644);
+MODULE_PARM_DESC(vp9_adapt_dump, "VP9 dump HW-adapted prob buffer (probs[ctx]) post-decode + refmode, observe-only (0=off,1=on)");
 #define VP9_PERTURB_SZ (3u * 1024 * 1024)
 static void *vp9_perturb_cpu;
 static dma_addr_t vp9_perturb_dma;
@@ -263,6 +346,14 @@ struct rkvdec_vdpu383_vp9_ctx {
 	struct {
 		u64 timestamp;
 		dma_addr_t dma;
+		/*
+		 * 2026-06-13 (#5a): coded dims of the frame in this slot, so a
+		 * later frame referencing it by timestamp can pack the correct
+		 * per-ref dimensions into the GBL (mvscale) — matching MPP's
+		 * ref_frame_coded_width[frame_refs[i].Index]. 0 = unknown.
+		 */
+		u32 width;
+		u32 height;
 		bool valid;
 	} ref_ring[8];
 	u32 ref_ring_next;
@@ -843,6 +934,31 @@ static void rkvdec_vdpu383_vp9_done(struct rkvdec_ctx *ctx,
 	const struct v4l2_ctrl_vp9_frame *frame_params;
 	struct v4l2_ctrl *ctrl;
 
+	/* 2026-06-08 compound "why" probe: dump HW's post-decode adapted prob
+	 * buffer (= what modes HW decoded) for the ours-vs-MPP compound diff. */
+	if (vp9_adapt_dump && result == VB2_BUF_STATE_DONE) {
+		struct rkvdec_vdpu383_vp9_priv_tbl *tbl = vp9_ctx->priv_tbl.cpu;
+		u32 cid = vp9_ctx->cur.frame_context_idx;
+		static unsigned int adapt_run;
+
+		if (tbl && cid < VP9_NUM_FRAME_CTX) {
+			u8 *ap = tbl->probs.probs[cid];
+
+			/* Adapted inter-mode region: comp_mode@116[5], comp_ref@121[5],
+			 * single_ref@126[10] (Section-1=80B + y_mode 36B). These encode
+			 * whether HW decoded compound vs single-ref blocks. Compare the
+			 * compound frame (refmode=2) vs the KEY (refmode=0, both ctx0):
+			 * KEY is intra so doesn't touch inter probs -> its values are the
+			 * ctx0 input; the compound frame's delta from it = what HW decoded.
+			 */
+			pr_info("rkvdec-vp9 adapt-dump: run=%u ctx=%u refmode=%u crc=%08x comp_mode@116=%*ph | comp_ref+single@121=%*ph\n",
+				adapt_run, cid, vp9_ctx->cur.reference_mode,
+				crc32(0, ap, RKVDEC_VP9_PROBE_SIZE),
+				5, ap + 116, 15, ap + 121);
+		}
+		adapt_run++;
+	}
+
 	/*
 	 * 2026-05-31 Round 7 diagnostic: dump dst buffer bytes for
 	 * tiny-frame (02-size cluster) content.
@@ -985,6 +1101,10 @@ static void rkvdec_vdpu383_vp9_done(struct rkvdec_ctx *ctx,
 			dst_buf->vb2_buf.timestamp;
 		vp9_ctx->ref_ring[slot].dma =
 			vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
+		/* #5a: record the just-decoded frame's coded dims for later
+		 * per-ref GBL dimension lookup. */
+		vp9_ctx->ref_ring[slot].width  = vp9_ctx->cur.width;
+		vp9_ctx->ref_ring[slot].height = vp9_ctx->cur.height;
 		vp9_ctx->ref_ring[slot].valid = true;
 		vp9_ctx->ref_ring_next++;
 	}
@@ -1181,31 +1301,46 @@ static void vdpu383_vp9_config_global_hdr(
 	u32 w = fp->frame_width_minus_1 + 1;
 	u32 h = fp->frame_height_minus_1 + 1;
 	/* Reference frame dimensions per VP9 ref slot (LAST, GOLDEN, ALTREF).
-	 * MPP's vdpu38x_vp9d_uncomp_hdr looks these up via
-	 * pp->ref_frame_coded_width[pp->frame_refs[i].Index7Bits] which V4L2
-	 * doesn't expose directly. Use `last` dims for LAST when available;
-	 * for GOLDEN/ALTREF, fall back to current frame dims (best-effort
-	 * for streams without inter-resolution changes — covers crowd_run
-	 * and Sintel test corpus).
+	 * KEY / INTRA_ONLY frames pack zeros for ref dimensions, matching the
+	 * vendor driver — packing current-frame dims for unused refs makes the
+	 * IP block treat them as live and can trigger spurious chroma-ref
+	 * activity.
+	 *
+	 * #5a fix (2026-06-13): per-ref coded dimensions, looked up by each
+	 * reference's timestamp against the ref_ring — the V4L2 analogue of
+	 * MPP's ref_frame_coded_width[frame_refs[i].Index]. The old code used
+	 * the *current* frame's dims for GOLDEN/ALTREF (and the immediately-
+	 * previous frame's dims for LAST), which is correct only when every
+	 * reference is the same resolution as the current frame. For
+	 * scaled-reference frames that produced a wrong mvscale. The lookup
+	 * falls back to the current dims when the ref isn't in the ring (or its
+	 * dims are unknown), so same-resolution content is byte-identical to
+	 * the old behaviour.
 	 */
-	/* KEY / INTRA_ONLY frames: pack zeros for ref dimensions, matching
-	 * the vendor driver. Packing current-frame dims here makes the IP
-	 * block treat the (unused) refs as live, which can trigger spurious
-	 * chroma-ref activity.
-	 */
-	u32 ref_w[3] = {
-		is_intra ? 0 : (last->valid ? last->width  : w),
-		is_intra ? 0 : w,
-		is_intra ? 0 : w,
-	};
-	u32 ref_h[3] = {
-		is_intra ? 0 : (last->valid ? last->height : h),
-		is_intra ? 0 : h,
-		is_intra ? 0 : h,
-	};
+	u32 ref_w[3], ref_h[3];
 	bool use_prev_mvs;
 	bool last_wh_eq;
-	int i, j;
+	int i, j, ri;
+
+	for (ri = 0; ri < 3; ri++) {
+		u64 ref_ts = (ri == 0) ? fp->last_frame_ts :
+			     (ri == 1) ? fp->golden_frame_ts :
+					 fp->alt_frame_ts;
+		u32 rw = w, rh = h;
+		u32 k;
+
+		for (k = 0; k < ARRAY_SIZE(vp9_ctx->ref_ring); k++) {
+			if (vp9_ctx->ref_ring[k].valid &&
+			    vp9_ctx->ref_ring[k].timestamp == ref_ts &&
+			    vp9_ctx->ref_ring[k].width) {
+				rw = vp9_ctx->ref_ring[k].width;
+				rh = vp9_ctx->ref_ring[k].height;
+				break;
+			}
+		}
+		ref_w[ri] = is_intra ? 0 : rw;
+		ref_h[ri] = is_intra ? 0 : rh;
+	}
 
 	memset(vp9_ctx->gbl_buf.cpu, 0, VDPU383_VP9_GBL_SIZE);
 
@@ -1644,6 +1779,48 @@ static void vdpu383_vp9_build_regs(
 				memunmap(pad_cpu);
 			}
 		}
+
+		/* 2026-06-12 fable review — stream-tail sensitivity probe.
+		 * The pad memset above writes through a MEMREMAP_WB alias with
+		 * no cache clean, and only for <512 B frames; the HW reads
+		 * [strm_base, strm_base + reg66) which extends past the
+		 * payload. Probe whether the bytes in that tail reach the
+		 * entropy decoder on the failing tiny frames:
+		 *   vp9_tail_dbg=1  re-zero the pad page-by-page + cache clean
+		 *   vp9_tail_dbg=2  poison the pad with 0xAA + cache clean
+		 * Page-by-page iova->phys per [[vdpu383_iommu_scatter_memset_crash]].
+		 * Diagnostic only, default off. */
+		if (vp9_tail_dbg && pad_off + pad_len <= plane_sz) {
+			struct rkvdec_dev *rkvdec = ctx->dev;
+			struct iommu_domain *dom =
+				iommu_get_domain_for_dev(rkvdec->dev);
+			u8 fill = (vp9_tail_dbg == 2) ? 0xAA : 0x00;
+			u32 done = 0;
+
+			while (dom && done < pad_len) {
+				u32 off = pad_off + done;
+				u32 in_page = PAGE_SIZE - ((src_dma + off) &
+							   ~PAGE_MASK);
+				u32 chunk = min(pad_len - done, in_page);
+				phys_addr_t pa = iommu_iova_to_phys(
+					dom, (src_dma + off) & PAGE_MASK);
+				void *va = pa ? memremap(pa, PAGE_SIZE,
+							 MEMREMAP_WB) : NULL;
+
+				if (!va)
+					break;
+				memset(va + ((src_dma + off) & ~PAGE_MASK),
+				       fill, chunk);
+				memunmap(va);
+				done += chunk;
+			}
+			dma_sync_single_for_device(rkvdec->dev,
+						   src_dma + pad_off, pad_len,
+						   DMA_TO_DEVICE);
+			pr_info("rkvdec-vp9 tail-dbg: mode=%d strm_len=%u pad=[%u,%u) filled=%u\n",
+				vp9_tail_dbg, strm_len, pad_off,
+				pad_off + pad_len, done);
+		}
 	}
 
 	regs->h26x_params.reg068_hor_virstride            = hw_hor;
@@ -1745,15 +1922,31 @@ static void vdpu383_vp9_build_regs(
 		size_t sz;
 		int p, slot;
 
-		for (p = 0; p < (int)ARRAY_SIZE(prio_to_slot); p++) {
-			slot = prio_to_slot[p];
-			if (slot >= rkvdec_rcb_buf_count(ctx))
-				continue;
-			sz = rkvdec_rcb_buf_size(ctx, slot);
-			regs->common_addr.reg140_162_rcb_info[slot].offset =
-				base + cum_off;
-			regs->common_addr.reg140_162_rcb_info[slot].size = sz;
-			cum_off += ALIGN(sz, SZ_4K);
+		if (rcb_sram_pack) {
+			/*
+			 * 2026-06-09 packed mode: the allocator placed each region
+			 * individually (high-priority ones in SRAM, rest DRAM), so
+			 * program each slot at its OWN dma — the regions are not a
+			 * single contiguous block here. (Priority is already reflected
+			 * in which regions the allocator put in SRAM.)
+			 */
+			for (slot = 0; slot < rkvdec_rcb_buf_count(ctx); slot++) {
+				regs->common_addr.reg140_162_rcb_info[slot].offset =
+					lower_32_bits(rkvdec_rcb_buf_dma_addr(ctx, slot));
+				regs->common_addr.reg140_162_rcb_info[slot].size =
+					rkvdec_rcb_buf_size(ctx, slot);
+			}
+		} else {
+			for (p = 0; p < (int)ARRAY_SIZE(prio_to_slot); p++) {
+				slot = prio_to_slot[p];
+				if (slot >= rkvdec_rcb_buf_count(ctx))
+					continue;
+				sz = rkvdec_rcb_buf_size(ctx, slot);
+				regs->common_addr.reg140_162_rcb_info[slot].offset =
+					base + cum_off;
+				regs->common_addr.reg140_162_rcb_info[slot].size = sz;
+				cum_off += ALIGN(sz, SZ_4K);
+			}
 		}
 	}
 
@@ -2044,12 +2237,34 @@ static void vdpu383_vp9_build_regs(
 	 * for the displayed compound frame (SHOW_FRAME, !KEY, !INTRA, small
 	 * strm) so we hit F2 and not the hidden alt-ref F1.
 	 */
-	if (vp9_perturb_refs && alt_dma && alt_dma != dst_dma &&
+	if ((vp9_perturb_refs || vp9_iova_fault) && alt_dma && alt_dma != dst_dma &&
 	    (fp->flags & V4L2_VP9_FRAME_FLAG_SHOW_FRAME) &&
 	    !(fp->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME) &&
 	    !(fp->flags & V4L2_VP9_FRAME_FLAG_INTRA_ONLY) &&
 	    strm_len < 4096) {
 		struct rkvdec_dev *rkvdec = ctx->dev;
+
+		/*
+		 * Cat 5.1 IOMMU access trace takes precedence over the content
+		 * perturb: redirect last/golden to UNMAPPED sentinels so any HW
+		 * read of those legs page-faults at a recognisable address.
+		 */
+		if (vp9_iova_fault) {
+			/* distinct sentinels per leg+kind so a fault address
+			 * attributes the read: dead=last-pixel, deae=golden-pixel,
+			 * dac0=last-payload, dab0=golden-payload */
+			u32 last_px = 0xDEAD0000u, gold_px = 0xDEAE0000u;
+			u32 last_pl = 0xDAC00000u, gold_pl = 0xDAB00000u;
+
+			regs->vp9_addr.reg170_last_ref_base     = last_px;
+			regs->vp9_addr.reg171_golden_ref_base   = gold_px;
+			regs->vp9_addr.reg195_payload_ref0_base = last_pl;
+			regs->vp9_addr.reg196_payload_ref1_base = gold_pl;
+			pr_info("VP9-IOVA-FAULT show-compound: last_px=%#x last_pl=%#x golden_px=%#x golden_pl=%#x alt=%#x kept strm=%u\n",
+				last_px, last_pl, gold_px, gold_pl,
+				lower_32_bits(alt_dma), (u32)strm_len);
+			goto perturb_done;
+		}
 
 		if (!vp9_perturb_cpu) {
 			vp9_perturb_cpu = dma_alloc_coherent(rkvdec->dev,
@@ -2057,7 +2272,61 @@ static void vdpu383_vp9_build_regs(
 			if (vp9_perturb_cpu)
 				memset(vp9_perturb_cpu, 0x00, VP9_PERTURB_SZ);
 		}
-		if (vp9_perturb_cpu) {
+		if (vp9_perturb_refs == 4) {
+			/* 2026-06-12 fable review — dst-prefill probe: every ref
+			 * address register (incl. error-ref) proved output-
+			 * irrelevant for the failing frame. Pre-fill the DST
+			 * (decout) buffer with 0x55 page-by-page before the kick:
+			 *   all-0x55 out      -> HW wrote a different buffer
+			 *   bottom 0x55-mixed -> HW predicts in-place from dst
+			 *   unchanged          -> full overwrite, source unknown */
+			struct rkvdec_dev *rkvdec2 = ctx->dev;
+			struct iommu_domain *dom2 =
+				iommu_get_domain_for_dev(rkvdec2->dev);
+			size_t dsz = vb2_plane_size(&dst_buf->vb2_buf, 0);
+			size_t done2 = 0;
+
+			while (dom2 && done2 < dsz) {
+				phys_addr_t pa2 = iommu_iova_to_phys(
+					dom2, (dst_dma + done2) & PAGE_MASK);
+				void *va2 = pa2 ? memremap(pa2, PAGE_SIZE,
+							   MEMREMAP_WB) : NULL;
+				if (!va2)
+					break;
+				memset(va2, 0x55, PAGE_SIZE);
+				memunmap(va2);
+				done2 += PAGE_SIZE;
+			}
+			dma_sync_single_for_device(rkvdec2->dev, dst_dma, dsz,
+						   DMA_TO_DEVICE);
+			pr_info("VP9-PERTURB-DSTFILL: filled %zu/%zu of dst %#x with 0x55\n",
+				done2, dsz, lower_32_bits(dst_dma));
+		} else if (vp9_perturb_cpu && vp9_perturb_refs == 3) {
+			/* 2026-06-12 fable review — error-ref probe: all three
+			 * real ref legs proved output-irrelevant on the failing
+			 * frame (modes 1+2 byte-identical), so test whether the
+			 * prediction pixels flow through the ERROR-CONCEALMENT
+			 * reference (reg169/reg194, which we point at dst). */
+			u32 p32 = lower_32_bits(vp9_perturb_dma);
+
+			regs->vp9_addr.reg169_error_ref_base         = p32;
+			regs->vp9_addr.reg194_payload_error_ref_base = p32;
+			pr_info("VP9-PERTURB-ERRREF show-compound: error_ref->scratch %#x (refs kept) strm=%u\n",
+				p32, (u32)strm_len);
+		} else if (vp9_perturb_cpu && vp9_perturb_refs == 2) {
+			/* 2026-06-12 fable review — mirror probe: redirect the
+			 * ALT leg only (header reg172 + payload reg197), keep
+			 * last/golden. If the whole-frame output changes, every
+			 * block's prediction flows through the ALT leg (the
+			 * "all refs resolve to ALT" routing claim); if only the
+			 * truly-alt-coded blocks change, ref routing is fine. */
+			u32 p32 = lower_32_bits(vp9_perturb_dma);
+
+			regs->vp9_addr.reg172_altref_ref_base   = p32;
+			regs->vp9_addr.reg197_payload_ref2_base = p32;
+			pr_info("VP9-PERTURB-ALT show-compound: alt->scratch %#x (last=%#x golden kept) strm=%u\n",
+				p32, lower_32_bits(alt_dma), (u32)strm_len);
+		} else if (vp9_perturb_cpu) {
 			u32 p32 = lower_32_bits(vp9_perturb_dma);
 
 			regs->vp9_addr.reg170_last_ref_base     = p32;
@@ -2067,6 +2336,8 @@ static void vdpu383_vp9_build_regs(
 			pr_info("VP9-PERTURB show-compound: last/golden->scratch %#x (alt=%#x kept) strm=%u\n",
 				p32, lower_32_bits(alt_dma), (u32)strm_len);
 		}
+perturb_done:
+		(void)rkvdec;
 	}
 
 	regs->vp9_addr.reg216_colmv_cur_base = colmv_dst32;
@@ -2622,6 +2893,20 @@ static int rkvdec_vdpu383_vp9_run(struct rkvdec_ctx *ctx)
 		}
 	}
 
+	/* 2026-06-08 input-dump: the INPUT context probs HW reads (reg184 ->
+	 * probs[ctx]) for this frame, first 160 B (partition..comp..inter_mode).
+	 * Compare vs MPP cabac_update to rule out an entropy-context divergence
+	 * upstream of the comp_mode decision. Fires at run() before the kick. */
+	if (vp9_adapt_dump) {
+		struct rkvdec_vdpu383_vp9_priv_tbl *t2 = vp9_ctx->priv_tbl.cpu;
+		u32 cid2 = vp9_ctx->cur.frame_context_idx;
+
+		if (t2 && cid2 < VP9_NUM_FRAME_CTX)
+			pr_info("rkvdec-vp9 input-dump: ctx=%u refmode=%u first160=%*ph\n",
+				cid2, vp9_ctx->cur.reference_mode,
+				160, t2->probs.probs[cid2]);
+	}
+
 	/*
 	 * R50 (2026-06-02) — alt-ref skip path. When enabled and the
 	 * current frame is alt-ref (SHOW_FRAME clear, not KEY, not
@@ -2653,6 +2938,9 @@ static int rkvdec_vdpu383_vp9_run(struct rkvdec_ctx *ctx)
 			dst_buf->vb2_buf.timestamp;
 		vp9_ctx->ref_ring[slot].dma =
 			vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
+		/* #5a: dims for per-ref GBL dimension lookup (skip-altref path). */
+		vp9_ctx->ref_ring[slot].width  = fp->frame_width_minus_1 + 1;
+		vp9_ctx->ref_ring[slot].height = fp->frame_height_minus_1 + 1;
 		vp9_ctx->ref_ring[slot].valid = true;
 		vp9_ctx->ref_ring_next++;
 
@@ -3026,12 +3314,13 @@ static int rkvdec_vdpu383_vp9_run(struct rkvdec_ctx *ctx)
 	 * MMIO writes appear to disrupt HW state in some way.
 	 * Kept the historical writes only.
 	 */
-	/* vp9_cache_all: 0=CACHE0 only (default), 1=all 3 caches,
-	 * 2=skip all cache writes (test if per-frame cache writes matter;
-	 * MPP writes caches only on the first task of a session). */
+	/* vp9_cache_all: 0=CACHE0 only (default), 1=all 3 caches (SIZE+CLEAR),
+	 * 2=skip all cache writes, 3=enable CACHE1/2 SIZE/permit but do NOT clear
+	 *   them (2026-06-10 throughput: warm the reference caches without the
+	 *   per-frame cold-clear that doubles 4K decode time). */
 	if (vp9_cache_all != 2) {
 		writel(0x1u | 0x2u | 0x10u, rkvdec->regs + 0x41c); /* CACHE0_SIZE */
-		if (vp9_cache_all == 1) {
+		if (vp9_cache_all == 1 || vp9_cache_all == 3) {
 			writel(0x1u | 0x2u | 0x10u, rkvdec->regs + 0x45c); /* CACHE1_SIZE */
 			writel(0x1u | 0x2u | 0x10u, rkvdec->regs + 0x49c); /* CACHE2_SIZE */
 		}
@@ -3336,10 +3625,18 @@ static int rkvdec_vdpu383_vp9_run(struct rkvdec_ctx *ctx)
 	/* Bug A: tiny show-alt-ref frames (<512B) always core_timeout on VDPU383.
 	 * Override just the HW LINK threshold to ~0.9ms so the core resets fast;
 	 * SW watchdog keeps VDPU383_TIMEOUT_4K for IRQ delivery safety margin.
-	 */
+	 *
+	 * 2026-06-12 fable review: the <512 B boundary of the refs-bypassed
+	 * decode mode (tiny frames perturb-immune, MC ignores all ref address
+	 * registers) is EXACTLY this condition — the only stack-specific,
+	 * kick-time, link-block write no register comparison ever covered
+	 * (MPP has no tiny-frame special case). vp9_tiny_timeout=0 disables
+	 * the override (normal resolution-based threshold for all frames)
+	 * to test whether the override itself arms the degraded mode. */
 	{
-		u32 link_timeout = (vb2_get_plane_payload(&src->vb2_buf, 0) < 512)
-			? 500000 : timeout_threshold;
+		u32 link_timeout = (vp9_tiny_timeout &&
+				    vb2_get_plane_payload(&src->vb2_buf, 0) < 512)
+			? (u32)vp9_tiny_timeout : timeout_threshold;
 		writel(link_timeout, rkvdec->link + VDPU383_LINK_TIMEOUT_THRESHOLD);
 	}
 	/*
@@ -3596,7 +3893,75 @@ static int rkvdec_vdpu383_vp9_run(struct rkvdec_ctx *ctx)
 	if (r42_irq_settle_us > 0)
 		usleep_range(r42_irq_settle_us, r42_irq_settle_us + 10);
 
+	/*
+	 * 2026-06-09 input-equivalence: CRC the ENTROPY INPUT prob buffer
+	 * (probs[frame_context_idx] = what reg184 hands HW) right before the kick,
+	 * to byte-compare against MPP's cabac_last/update for the compound frame.
+	 * If an earlier prob (coef/skip/tx/inter-mode) differs from MPP, the
+	 * arithmetic decoder desyncs before the compound decision. Segment CRCs
+	 * localise any divergence. Gated on vp9_adapt_dump.
+	 */
+	if (vp9_adapt_dump) {
+		struct rkvdec_vdpu383_vp9_priv_tbl *t = vp9_ctx->priv_tbl.cpu;
+		u32 c = vp9_ctx->cur.frame_context_idx;
+
+		if (t && c < VP9_NUM_FRAME_CTX) {
+			u8 *ip = t->probs.probs[c];
+
+			pr_info("rkvdec-vp9 input-crc: refmode=%u ctx=%u all2432=%08x s0=%08x s1=%08x s2=%08x\n",
+				vp9_ctx->cur.reference_mode, c,
+				crc32(0, ip, 2432),
+				crc32(0, ip, 512),
+				crc32(0, ip + 512, 512),
+				crc32(0, ip + 1024, 1408));
+			/* localise the s0 divergence: bytes 48..223 (seg/skip/tx/is_inter/
+			 * y_mode/comp_mode/comp_ref/single_ref/inter_mode region) */
+			/* one-shot full byte dump of the first compound (refmode==2)
+			 * frame's entropy input — for a CRC-independent byte-for-byte
+			 * diff against MPP cabac_last */
+			{
+				static int dumped_compound;
+				if (vp9_ctx->cur.reference_mode == 2 && !dumped_compound) {
+					dumped_compound = 1;
+					print_hex_dump(KERN_INFO, "vp9f2in ",
+						DUMP_PREFIX_OFFSET, 32, 1, ip, 2432, false);
+				}
+			}
+		}
+	}
+
+	/* Cat 6.1 reserved-bit fuzz: OR a mask into a common register on the
+	 * compound frame, last thing before the kick (after all normal writes). */
+	if (vp9_regfuzz_reg >= 0 && vp9_ctx->cur.reference_mode == 2) {
+		void __iomem *fa = rkvdec->regs + VDPU383_OFFSET_COMMON_REGS +
+				   vp9_regfuzz_reg * 4;
+		u32 before = readl(fa);
+
+		writel(before | vp9_regfuzz_or, fa);
+		pr_info("VP9-REGFUZZ: reg%03d off=%#x before=%08x or=%08x after=%08x\n",
+			8 + vp9_regfuzz_reg,
+			VDPU383_OFFSET_COMMON_REGS + vp9_regfuzz_reg * 4,
+			before, vp9_regfuzz_or, readl(fa));
+	}
+
+	/* 2026-06-10 E1: flush the cached RCB to device before the kick (no-op
+	 * unless rcb_cached). Mirrors the BSP per-frame dma_sync over its
+	 * dma-buf-cache context buffers — VDPU383_LIFECYCLE_MAP §3.2/3.3. */
+	rkvdec_rcb_sync_for_device(ctx);
+
 	writel(VDPU383_IP_CRU_MODE, rkvdec->link + VDPU383_LINK_IP_ENABLE);
+	/* 2026-06-12 fable review — BSP arms irq_mask 0x30000 (INT_EN bit0 +
+	 * LINE_IRQ bit1) for every task in both its modes; our single-shot
+	 * inherits whatever INT_EN was left armed (bit0 via ISR re-arm).
+	 * Gated test of whether the LINE_IRQ enable is load-bearing for the
+	 * VP9 tiny-frame refs-bypass (the last never-compared LINK-surface
+	 * difference). */
+	if (vp9_int_lineirq)
+		writel(FIELD_PREP_WM16(VDPU383_INT_EN_IRQ |
+				       VDPU383_INT_EN_LINE_IRQ,
+				       VDPU383_INT_EN_IRQ |
+				       VDPU383_INT_EN_LINE_IRQ),
+		       rkvdec->link + VDPU383_LINK_INT_EN);
 	/* wmb() + readl(reg15) before the HW kick: drain posted writes so
 	 * the IP block sees all register state in order. A plain mb() is
 	 * over-strong here (it can stall the AXI bus); wmb followed by a

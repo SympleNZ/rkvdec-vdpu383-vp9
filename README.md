@@ -14,7 +14,7 @@ downstream-first: working code plus a precise, fully-triaged question for the
 people with the hardware documentation (Collabora / the VDPU383 maintainers). See
 [The reference-bypass bug](#the-reference-bypass-bug-the-open-question).
 
-> Status as of 2026-06-13. Independent development on the RK3576 VDPU383.
+> Status as of 2026-06-16. Independent development on the RK3576 VDPU383.
 >
 > **Correction (2026-06-13):** earlier revisions framed the open bug as
 > *compound-prediction-specific* ("SELECT frames collapse to an alt-ref copy").
