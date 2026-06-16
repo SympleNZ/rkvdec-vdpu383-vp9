@@ -179,10 +179,14 @@ large-frame compound-free content is perfect.
   reference resolves via the normal by-timestamp path (the same HEVC uses).
 - **Every programmable input is byte-identical to MPP** — register descriptor, GBL
   header, the full 2432 B entropy-input probability buffer (0/2432), bitstream.
-- **Completion is clean** (DEC_RDY, no error/reset/timeout); single-shot and link
-  submit fail identically; INT_EN line-IRQ arming, `frame-parallel=0`,
-  `error-resilient=1`, firmware (BL31 v1.17), clocks, register write order, and
-  RCB SRAM-vs-DRAM placement all change nothing.
+- **Completion is clean** (DEC_RDY, no error/reset/timeout); INT_EN line-IRQ
+  arming, `frame-parallel=0`, `error-resilient=1`, firmware (BL31 v1.17), clocks,
+  register write order, and RCB SRAM-vs-DRAM placement all change nothing.
+  (Submission model is not the cause — decisively, HEVC and H.264 small inter
+  frames are byte-exact under the *same* GBL-header submission path; see the
+  VP9-specific bullet above. This driver's experimental link-mode submit does not
+  run as a clean continuous node on the mainline stack, so it is not a usable
+  comparison point either way.)
 - **The two-reference averaging unit is sound:** HEVC B-frame bi-prediction (the
   VP9-compound analogue) is byte-exact on this stack — and HEVC small frames are
   byte-exact — so neither the averaging arithmetic nor small-frame handling in
