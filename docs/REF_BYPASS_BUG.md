@@ -240,16 +240,31 @@ same silicon, the divergence is **internal hardware execution/state below every 
 mainline V4L2 stack can touch** — the same conclusion the AV1 sibling reached independently
 (`rkvdec-vdpu383-av1`).
 
-**(d) One dimension still un-examined — per-frame PM / IOMMU / clock cycling.** A full
-hardware-access trace of MPP shows it cycles, *per frame*: IOMMU TLB flush (~4×), IOMMU
-re-initialisation (`rk_iommu_resume`, ~3×), and decoder-clock gating — operations our stack does
-not perform per frame (we hold power/clocks on). Replicating MPP's per-frame *cycling* (earlier
-work tested the opposite — power forced continuously on) is the next decisive test, pursued via
-a full hardware-access diff (our kernel rebuilt with `CONFIG_TRACE_MMIO_ACCESS=y`). Honest
-caveat: a 0.346 sub-pel-precision error is a *weak* fit for an IOMMU/addressing cause (those
-corrupt grossly), so clock/reset/PM-state cycling is weighted above IOMMU.
+**(d) The last open lead — per-frame PM / IOMMU / clock cycling — tested and REFUTED (2026-06-27).**
+A full hardware-access trace of MPP showed it cycles, *per frame*: IOMMU TLB flush, IOMMU
+re-initialisation (`rk_iommu_resume`), and decoder-clock gating. We forced our driver to do the
+same — genuine per-frame suspend→resume with IOMMU re-init, clock off/on and the RK3576 warmup,
+ftrace-confirmed to land *between* the KEY frame and the first INTER frame, escalated 1→12 cycles.
+**It changed nothing — byte-identical wrong output (VP9) and 0/39 exact (AV1), every cycling
+intensity.** Operation-class coverage is now complete: our driver exercises every clock / IOMMU /
+reset / PM / warmup operation class MPP does — no MPP operation class is absent. (A first-pass
+source diff also corrected the premise: in MPP's link/CCU mode, PM and clocks are burst-level,
+not strictly per-frame; the only true per-frame op is the IOMMU TLB flush + cache-clear, both of
+which our driver already performs.)
 
-**The sharpened question for the hardware owners:** what per-frame PM / clock / IOMMU / internal-
-state-init step does the VDPU383 require for VP9 (and AV1) INTER decode that H.264 and HEVC do
-not — given every programmable input, the stream bytes, the submission sequence, and the
-continuously-armed ring are byte-identical to MPP, yet MPP decodes correctly and we do not?
+**(e) The decisive observation — the decode starts correct and diverges mid-frame.** On the AV1
+sibling, frame 0's first 16 bytes are **byte-exact to the reference**, yet the frame's Y-MAE is
+~90 — the hardware receives correct inputs (proven byte-identical), *begins* decoding correctly,
+and diverges during its own internal pass. VP9 fails deterministically, AV1 metastably; same wall.
+There is no driver-side input or operation that can alter a computation the hardware performs
+correctly at the start of a frame and wrong by the end. **The investigation is terminal.** The one
+un-run check (a register-*value* `rwmmio` diff) needs a full Armbian vendor-kernel rebuild (high
+cost / per-boot re-brick risk) and is very unlikely to surface anything new, since the decoder
+register values are already proven byte-identical and the core clk/IOMMU register values are not
+our code.
+
+**The question for the hardware owners:** what internal per-frame state or init step does the
+VDPU383 require for VP9 (and AV1) INTER decode that H.264 and HEVC do not — given every
+programmable input, the stream bytes, the submission sequence, the continuously-armed ring, *and*
+the full clock/IOMMU/PM/warmup operation set are replicated from MPP, the decode *starts* correct,
+yet diverges mid-frame while MPP (same silicon) is bit-exact?

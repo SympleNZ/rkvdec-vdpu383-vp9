@@ -41,10 +41,18 @@ people with the hardware documentation (Collabora / the VDPU383 maintainers). Se
 > path (not MMIO), a submission sequence **identical to the working HEVC backend**,
 > and a **continuously-armed link ring** (HW armed across KEY→INTER, no disarm —
 > append branch confirmed firing). Every one tested; output still wrong. The AV1
-> sibling reached the identical wall independently. **One dimension remains
-> un-examined for both:** MPP's per-frame **PM / IOMMU / clock cycling**
-> (per-task TLB flush, IOMMU re-init, clock gating) — the subject of ongoing work.
-> See [`docs/REF_BYPASS_BUG.md`](docs/REF_BYPASS_BUG.md).
+> sibling reached the identical wall independently.
+> 3. **The last open lead — per-frame PM/IOMMU/clock cycling — is now refuted
+>    (2026-06-27).** Forcing genuine per-frame suspend→resume cycles (IOMMU re-init +
+>    clock off/on + warmup, ftrace-confirmed landing *between* KEY and the first INTER
+>    frame, escalated up to 12 cycles) changed nothing — byte-identical wrong output
+>    (VP9) and 0/39 exact (AV1). Operation-class coverage is complete: our driver
+>    exercises every clock / IOMMU / reset / PM / warmup operation class MPP does. And
+>    the decisive observation — **the decode starts correct and diverges mid-frame**
+>    (AV1 frame 0's first 16 bytes are byte-exact to the reference, yet its Y-MAE is
+>    ~90): the hardware gets correct inputs, begins decoding correctly, and diverges
+>    during its own internal pass. Below-MMIO by definition; the investigation is
+>    terminal. See [`docs/REF_BYPASS_BUG.md`](docs/REF_BYPASS_BUG.md).
 
 ---
 
