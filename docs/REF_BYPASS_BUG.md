@@ -199,3 +199,57 @@ where VP9 MC reference fetch differs from HEVC on this IP would be decisive.
    to HDMI and observe corruption; a compound-free large-frame clip is perfect.
 5. **Cross-codec control:** the same static scene encoded as H.264 or HEVC (with
    equally tiny inter frames) decodes byte-exact — only VP9 fails.
+
+---
+
+## 7. 2026-06-26 update — exhaustive MPP replication; below-MMIO hardened; open PM/IOMMU lead
+
+Since the 2026-06-13 writeup the triage was pushed to its limit. Summary of what is now
+established, and the one dimension still open.
+
+**(a) It is genuinely our-driver-wrong, not a silicon limit — proven against MPP and software.**
+On a single md5-identical clip (`vp9fail.ivf`, BBB 640×360 libvpx-vp9 crf50), decoded on the
+*same* VDPU383 silicon:
+- MPP vs ffmpeg/libvpx (software): **0.000 — bit-exact**, deterministic.
+- our V4L2 stack vs both: **0.346** mean abs error on the first INTER frame, cascading.
+
+So MPP and the software reference agree exactly; ours is the outlier. The hardware can decode
+this stream correctly — our mainline stack does not.
+
+**(b) A second manifestation — sub-pel precision.** Beyond the gross reference-bypass on tiny
+frames, complex / high-q INTER content shows a subtle sub-pel-precision drift (q-sweep: high-q
+prediction-dominant frames fail, low-q residual-rich frames pass). Same below-MMIO wall, a
+different surface; the residual masks it at low q.
+
+**(c) Every software-reachable input and mechanism replicated to MPP — still wrong.** Using the
+BSP `Vdpu383RegSet` offsetof field-map for an apples-to-apples register diff:
+- `ctrl_regs` (r8–30) and `comm_paras` (r64–106, incl. reference strides/dims/mv-scaling and
+  stream framing) are **byte-identical to MPP** for both the KEY and the failing INTER frame;
+- the **stream bytes the HW reads** are byte-identical to the canonical IVF frame;
+- RCB buffer sizes differ (over-allocated) but are **output-invariant** (scale 1×==2×);
+- `colmv` is **not read** for the first failing frame (`use_prev_mvs=0`, prev is KEY);
+- config delivered via the **DRAM-descriptor HW-fetch** path (skipping the redundant MMIO
+  register write) produces **byte-identical wrong output** — delivery mechanism is not the cause;
+- the per-frame **submission sequence is identical to the working HEVC backend** (and H.264
+  uses a different sequence yet also works — sequence does not separate working from failing);
+- a **continuously-armed link ring** (append branch confirmed firing: 1 bootstrap + N appends,
+  HW armed across KEY→INTER with no disarm, exactly as MPP) — **still 0.346 wrong**.
+
+With all of the above identical to MPP and the output still wrong while MPP is bit-exact on the
+same silicon, the divergence is **internal hardware execution/state below every interface the
+mainline V4L2 stack can touch** — the same conclusion the AV1 sibling reached independently
+(`rkvdec-vdpu383-av1`).
+
+**(d) One dimension still un-examined — per-frame PM / IOMMU / clock cycling.** A full
+hardware-access trace of MPP shows it cycles, *per frame*: IOMMU TLB flush (~4×), IOMMU
+re-initialisation (`rk_iommu_resume`, ~3×), and decoder-clock gating — operations our stack does
+not perform per frame (we hold power/clocks on). Replicating MPP's per-frame *cycling* (earlier
+work tested the opposite — power forced continuously on) is the next decisive test, pursued via
+a full hardware-access diff (our kernel rebuilt with `CONFIG_TRACE_MMIO_ACCESS=y`). Honest
+caveat: a 0.346 sub-pel-precision error is a *weak* fit for an IOMMU/addressing cause (those
+corrupt grossly), so clock/reset/PM-state cycling is weighted above IOMMU.
+
+**The sharpened question for the hardware owners:** what per-frame PM / clock / IOMMU / internal-
+state-init step does the VDPU383 require for VP9 (and AV1) INTER decode that H.264 and HEVC do
+not — given every programmable input, the stream bytes, the submission sequence, and the
+continuously-armed ring are byte-identical to MPP, yet MPP decodes correctly and we do not?

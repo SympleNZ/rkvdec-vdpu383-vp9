@@ -23,6 +23,28 @@ people with the hardware documentation (Collabora / the VDPU383 maintainers). Se
 > is a small MC footprint, not compound mode; what were described as two bugs (the
 > "compound bug" and a "small-dimension single-ref inter bug") are one. See
 > [`docs/REF_BYPASS_BUG.md`](docs/REF_BYPASS_BUG.md).
+>
+> **Update (2026-06-26) — exhaustively triaged as below-MMIO; symmetric with AV1.**
+> Two further results harden the "below the register interface" conclusion:
+> 1. **It is genuinely our-driver-wrong, not a silicon limit.** MPP, on the *same*
+>    VDPU383 silicon, decodes the failing clip **bit-exact to the ffmpeg/libvpx
+>    software reference** (verified on a md5-identical file: MPP vs ffmpeg = 0.000;
+>    ours = 0.346 on the first INTER frame). The hardware *can* do it; our V4L2
+>    stack produces different pixels.
+> 2. **A second manifestation:** beyond the gross reference-bypass on tiny frames,
+>    complex / high-q INTER content shows a subtle **sub-pel-precision** drift that
+>    cascades through references — same wall, different surface.
+>
+> We then replicated MPP's decode path in our driver to the byte: identical register
+> file (`ctrl_regs` + `comm_paras` 0-diff via offsetof field-map), byte-identical
+> stream bytes the HW reads, config delivered via the **DRAM-descriptor HW-fetch**
+> path (not MMIO), a submission sequence **identical to the working HEVC backend**,
+> and a **continuously-armed link ring** (HW armed across KEY→INTER, no disarm —
+> append branch confirmed firing). Every one tested; output still wrong. The AV1
+> sibling reached the identical wall independently. **One dimension remains
+> un-examined for both:** MPP's per-frame **PM / IOMMU / clock cycling**
+> (per-task TLB flush, IOMMU re-init, clock gating) — the subject of ongoing work.
+> See [`docs/REF_BYPASS_BUG.md`](docs/REF_BYPASS_BUG.md).
 
 ---
 
