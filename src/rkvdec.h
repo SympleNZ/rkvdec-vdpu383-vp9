@@ -17,6 +17,7 @@
 #include <linux/wait.h>
 #include <linux/completion.h>
 #include <linux/clk.h>
+#include <linux/reset.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -156,8 +157,27 @@ struct rkvdec_dev {
 	struct clk_bulk_data *clocks;
 	unsigned int num_clocks;
 	struct clk *axi_clk;
+	/*
+	 * CRU reset lines (DT reset-names axi/ahb/cabac/core/hevc_cabac). MPP
+	 * asserts+deasserts a CRU softrst as part of rkvdec2_runtime_resume
+	 * (rwmmio trace .103: reset_control_assert at CRU 0xa280a34 bit 6); our
+	 * mainline driver uses NO reset_control. Gated by rkvdec_cru_reset.
+	 */
+	struct reset_control_bulk_data resets[5];
+	bool has_resets;
 	void __iomem *regs;
 	void __iomem *link;
+	/*
+	 * Dedicated read-cache register window (DT reg-name "cache",
+	 * phys 0x27b00600). MPP/BSP configures + clears the decoder read
+	 * caches HERE every decode (rwmmio trace .103 2026-06-24: cache+0x10/
+	 * 0x18/0x1c, +0x50, +0x90). Mainline historically never mapped it, so
+	 * our cache-clear writes landed in the function window tail (regs+0x41x)
+	 * and the cache was never actually configured -> stale reads -> the AV1
+	 * per-decode transient-then-converge non-determinism. NULL if the DT has
+	 * no "cache" resource (older variants).
+	 */
+	void __iomem *cache;
 	struct mutex vdev_lock; /* serializes ioctls */
 	struct delayed_work watchdog_work;
 	/*

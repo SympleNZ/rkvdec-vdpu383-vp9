@@ -26,6 +26,14 @@
 extern int r38_a_core_work_mode;
 extern int r46_link_desc_sync;
 extern int r47_link_barrier_strong;
+extern int warmup_pulse;
+
+/* 2026-06-26: count bootstrap-vs-append at enqueue. The continuous-arm
+ * hypothesis needs APPEND to actually fire (HW stays armed across frames).
+ * If it never fires, continuous arming was never truly tested. */
+int link_trace;
+module_param(link_trace, int, 0644);
+MODULE_PARM_DESC(link_trace, "Trace LINK bootstrap vs APPEND per enqueue (0=off,1=on)");
 
 /* ---- BSP cache offsets (mpp_rkvdec2.h:82-88) -------------------- */
 #define RKVDEC_BSP_CACHE0_SIZE	0x51c
@@ -483,6 +491,11 @@ int rkvdec_link_enqueue_vdpu383(struct rkvdec_link_table *table, u32 slot,
 		link_mode = frame_num | RKVDEC_BSP_LINK_ADD_MODE;
 	}
 
+	if (link_trace)
+		pr_info("LINK %s slot=%u frame_num=%u link_en=%u\n",
+			link_en ? "APPEND" : "bootstrap",
+			slot, frame_num, link_en);
+
 	writel_relaxed(link_mode, link_base + RKVDEC_BSP_LINK_MODE);
 
 	/* IP enable per task (BSP ip_en_base=0x58, ip_en_val=0x01000000). */
@@ -817,6 +830,38 @@ int rkvdec_rk3576_warmup_run(void __iomem *link_base, dma_addr_t buf_iova)
 {
 	u32 status;
 	int i;
+
+	/*
+	 * Lead A (warmup_pulse): pure register pulse — the 13 writes MPP's
+	 * rkvdec2_runtime_resume does (rwmmio trace .103 2026-06-24), arm+commit
+	 * then immediate clear, NO status poll. Primes the IP without running (and
+	 * waiting on) a real warmup decode.
+	 *
+	 * HAZARD/FINDING 2026-06-24: MPP writes 0x04=0xfffff000 (a constant) here.
+	 * Trying that on our stack IOMMU-FAULTED into a D-state hang (board needed
+	 * a physical power-cycle) — that address is unmapped in OUR domain but MPP
+	 * survives it (its IOMMU context/mapping differs — itself a stack-difference
+	 * data point). So 0x04 points at our VALID warmup descriptor instead; the
+	 * Lead-A variable under test is "no decode poll", not the junk address.
+	 */
+	if (warmup_pulse) {
+		writel(0x8000u,     link_base + 0x58);
+		writel(0x7ffffu,    link_base + 0x54);
+		writel(0x10001u,    link_base + 0x00);
+		writel(lower_32_bits(buf_iova) + 0x1000u,
+		       link_base + 0x04);              /* VALID desc (not 0xfffff000) */
+		writel(0x1u,        link_base + 0x08);
+		writel(0x1u,        link_base + 0x18);
+		writel(0x1u,        link_base + 0x0c);
+		writel(0xffff0000u, link_base + 0x48);
+		writel(0xffff0000u, link_base + 0x4c);
+		writel(0x0u,        link_base + 0x00);
+		writel(0x0u,        link_base + 0x08);
+		writel(0x0u,        link_base + 0x18);
+		writel(0x0u,        link_base + 0x58);
+		dmb(oshst);
+		return 0;
+	}
 
 	/* Verbatim sequence from rk3576_workaround_run disassembly. */
 	writel(0x8000u,      link_base + 0x58); /* ip_en_base, BIT(15) only  */

@@ -83,6 +83,35 @@ module_param(vp9_int_lineirq, int, 0644);
 MODULE_PARM_DESC(vp9_int_lineirq,
 		 "Arm INT_EN bits 0+1 (BSP irq_mask) at VP9 kick (0=off,1=on) - diagnostic");
 
+/* 2026-06-26: dump the full HW register file (reg0-211 = 848B, matching MPP's
+ * DUMP_VDPU38X_DATAS regs_full.dat) right before the kick, as print_hex_dump,
+ * so it can be diffed byte-for-byte against MPP's bit-exact ground truth.
+ * Decides whether the VP9 sub-pel bug is above-MMIO (a programmed-register
+ * delta we can fix) or below-MMIO like AV1 (registers identical, output wrong). */
+static int vp9_regdump;
+module_param(vp9_regdump, int, 0644);
+MODULE_PARM_DESC(vp9_regdump,
+		 "Dump full reg file (reg0-211) pre-kick for MPP diff (0=off,1=on)");
+
+/* 2026-06-26: dump the actual stream-buffer bytes the HW will read (first 48B
+ * + strm_len), to prove byte-identity with the canonical IVF frame data and
+ * close the gst-framing edge of the below-MMIO conclusion. */
+static int vp9_strm_dump;
+module_param(vp9_strm_dump, int, 0644);
+MODULE_PARM_DESC(vp9_strm_dump,
+		 "Dump first 48B + len of the stream buffer the HW reads (0=off,1=on)");
+
+/* 2026-06-26: in LINK mode, skip the redundant memcpy_toio register push so
+ * config reaches the HW ONLY via the DRAM descriptor fetch (exactly MPP's
+ * delivery). Disambiguates 'does VP9 need fetch-delivery vs MMIO-delivery':
+ * still-wrong = HW fetched descriptor (delivery irrelevant, below-MMIO);
+ * correct = MMIO writes were the problem (driver-addressable). Requires
+ * rkvdec_link_mode=1. */
+static int vp9_fetch_only;
+module_param(vp9_fetch_only, int, 0644);
+MODULE_PARM_DESC(vp9_fetch_only,
+		 "LINK mode: deliver config ONLY via descriptor fetch, skip memcpy_toio (0=off,1=on)");
+
 /*
  * 2026-06-04: clear all THREE decoder caches (CACHE0/1/2) like the BSP
  * mpp_service, not just CACHE0. The BSP MMIO trace (PHASE2_MPP_TRACE) clears
@@ -1734,6 +1763,25 @@ static void vdpu383_vp9_build_regs(
 	regs->h26x_params.reg065_strm_start_bit = 8 * (uncomp_len & 0xf);
 	regs->h26x_params.reg066_stream_len     = ((strm_len + 15) & ~15u) + 0x80;
 	regs->h26x_params.reg067_global_len     = VDPU383_VP9_GBL_LEN;
+
+	/* 2026-06-26: dump the actual bytes the HW will read from the stream
+	 * buffer, to prove byte-identity with the canonical IVF frame (closes
+	 * the gst-framing edge of the below-MMIO conclusion). Read-only. */
+	if (unlikely(vp9_strm_dump)) {
+		struct rkvdec_dev *rkvdec = ctx->dev;
+		struct iommu_domain *dom = iommu_get_domain_for_dev(rkvdec->dev);
+		u32 dlen = min_t(u32, strm_len, 48u);
+		phys_addr_t ph = dom ? iommu_iova_to_phys(dom, src_dma) : 0;
+		void *cpu = ph ? memremap(ph, dlen, MEMREMAP_WB) : NULL;
+
+		if (cpu) {
+			pr_info("VP9STRMDUMP strm_len=%u start_bit=%u\n", strm_len,
+				regs->h26x_params.reg065_strm_start_bit);
+			print_hex_dump(KERN_INFO, "VP9STRMDUMP ",
+				       DUMP_PREFIX_OFFSET, 16, 1, cpu, dlen, false);
+			memunmap(cpu);
+		}
+	}
 
 	/*
 	 * Zero the padding region after the bitstream payload.
@@ -3402,7 +3450,12 @@ static int rkvdec_vdpu383_vp9_run(struct rkvdec_ctx *ctx)
 			vp9_ctx->regs.vp9_addr.reg171_golden_ref_base,
 			vp9_ctx->regs.vp9_addr.reg172_altref_ref_base);
 
-	vdpu383_vp9_write_regs(ctx);
+	/* 2026-06-26: fetch-only delivery test — in link mode, optionally skip
+	 * the MMIO push so config reaches the HW solely via the descriptor. */
+	if (!(rkvdec_link_mode && vp9_fetch_only))
+		vdpu383_vp9_write_regs(ctx);
+	else
+		pr_info_once("VP9 fetch-only: skipping memcpy_toio, config via descriptor fetch only\n");
 
 	/*
 	 * Diagnostic dump of the four assembled register substructs. Compares
@@ -3970,6 +4023,19 @@ static int rkvdec_vdpu383_vp9_run(struct rkvdec_ctx *ctx)
 	 */
 	wmb();
 	(void)readl(rkvdec->regs + VDPU383_OFFSET_COMMON_REGS + 7 * 4);
+
+	/* 2026-06-26: full reg-file readback (reg0-211) for byte-diff vs MPP
+	 * regs_full.dat. Read-only, immediately before the kick. */
+	if (unlikely(vp9_regdump)) {
+		static u32 vp9_regbuf[212];
+		int r;
+
+		for (r = 0; r < 212; r++)
+			vp9_regbuf[r] = readl(rkvdec->regs + r * 4);
+		print_hex_dump(KERN_INFO, "VP9REGDUMP ", DUMP_PREFIX_OFFSET,
+			       32, 4, vp9_regbuf, sizeof(vp9_regbuf), false);
+	}
+
 	writel(VDPU383_DEC_E_BIT,   rkvdec->link + VDPU383_LINK_DEC_ENABLE);
 
 	/* Phase 3 v0.3 step 1: DPB state-advance moved here from done(). */

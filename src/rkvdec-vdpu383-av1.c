@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/crc32.h>
+#include <linux/fs.h>		/* av1_dump_ctrls: filp_open/kernel_write capture */
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-mem2mem.h>
@@ -187,9 +188,19 @@ struct rkvdec_vdpu383_av1_dpb_slot {
  * Total at 1080p:  ~5.1 MB.
  * Total at 4K:    ~19.5 MB.
  */
+#define AV1_LINK_TASK_CAP 16	/* must match rkvdec_link_alloc_table task_capacity */
+
 struct rkvdec_vdpu383_av1_ctx {
 	/* DMA-coherent allocations */
-	struct rkvdec_aux_buf gbl_buf;
+	/*
+	 * Per-link-task gbl/header buffers (reg131). One per descriptor-ring
+	 * slot so an ADD_MODE-appended frame writes its own header instead of
+	 * overwriting the one an in-flight frame is still reading — the depth>1
+	 * append-disturbance (CCU_RING_STAGE0_AUDIT_2026-06-24; MPP keeps the
+	 * header in its per-task info buffer, fast_mode = our depth>1). The
+	 * single-shot path uses [0] only.
+	 */
+	struct rkvdec_aux_buf gbl_buf[AV1_LINK_TASK_CAP];
 	/*
 	 * default_prob_buf: read-only 29,600-byte default CDF table initialised
 	 * from av1_default_cdf[] in start().  KEY frames read from this buffer
@@ -239,6 +250,11 @@ struct rkvdec_vdpu383_av1_ctx {
 
 	/* CDF slot chosen by run() — read by done() for DPB write-back. */
 	u8	cur_cdf_slot;
+
+	/* Link descriptor-ring slot for THIS frame's per-task buffers
+	 * (gbl_buf[]). Set at the top of run() = link_table.next_slot in link
+	 * mode, 0 in single-shot. Read by config_global_hdr / config_addr_regs. */
+	u8	cur_link_slot;
 
 	/* ColMV slot written by the immediately preceding frame.
 	 * AV1_NUM_REF_FRAMES (8) = "none" sentinel (rfflags was 0 or decode failed). */
@@ -1281,7 +1297,8 @@ static void rkvdec_vdpu383_av1_free_bufs(struct rkvdec_ctx *ctx,
 	} \
 } while (0)
 
-	FREE_BUF(av1_ctx->gbl_buf);
+	for (i = 0; i < AV1_LINK_TASK_CAP; i++)
+		FREE_BUF(av1_ctx->gbl_buf[i]);
 	/* cache-aware free: noncoherent alloc needs dma_free_noncoherent (matched). */
 	if (av1_ctx->default_prob_cached) {
 		if (av1_ctx->default_prob_buf.cpu) {
@@ -1329,6 +1346,14 @@ static int rkvdec_vdpu383_av1_adjust_fmt(struct rkvdec_ctx *ctx,
 /* -----------------------------------------------------------------------
  * Session start / stop
  */
+/* 2026-06-24 placement probe: log per-session scratch DMA addresses (used in
+ * av1_start, declared here so it precedes that function). Correlate physical
+ * placement with the per-decode attractor lottery — cross-load variation
+ * suggests placement drives it. Default off. */
+static int av1_addr_log;
+module_param(av1_addr_log, int, 0644);
+MODULE_PARM_DESC(av1_addr_log, "AV1 log per-session scratch buffer DMA addresses (0=off,1=on) - placement probe");
+
 static int rkvdec_vdpu383_av1_start(struct rkvdec_ctx *ctx)
 {
 	struct rkvdec_dev *rkvdec = ctx->dev;
@@ -1346,15 +1371,20 @@ static int rkvdec_vdpu383_av1_start(struct rkvdec_ctx *ctx)
 	av1_ctx->last_written_colmv_slot = AV1_NUM_REF_FRAMES; /* 8 = "none" */
 	av1_ctx->colmv_valid_mask = 0; /* no colmv slots written yet */
 
-	/* GBL buffer (reg131_gbl_base) — one per session, reused each frame. */
-	av1_ctx->gbl_buf.size = VDPU383_AV1_GBL_SIZE;
-	av1_ctx->gbl_buf.cpu  = dma_alloc_coherent(rkvdec->dev,
-						    av1_ctx->gbl_buf.size,
-						    &av1_ctx->gbl_buf.dma,
-						    GFP_KERNEL);
-	if (!av1_ctx->gbl_buf.cpu) {
-		ret = -ENOMEM;
-		goto err_free_ctx;
+	/* GBL buffers (reg131_gbl_base) — one per link-task slot so a depth>1
+	 * ADD_MODE append doesn't overwrite an in-flight frame's header. Only
+	 * [0] is used in single-shot. ~784 bytes each, 16 = ~12.5 KB. */
+	av1_ctx->cur_link_slot = 0;
+	for (i = 0; i < AV1_LINK_TASK_CAP; i++) {
+		av1_ctx->gbl_buf[i].size = VDPU383_AV1_GBL_SIZE;
+		av1_ctx->gbl_buf[i].cpu  = dma_alloc_coherent(rkvdec->dev,
+							av1_ctx->gbl_buf[i].size,
+							&av1_ctx->gbl_buf[i].dma,
+							GFP_KERNEL);
+		if (!av1_ctx->gbl_buf[i].cpu) {
+			ret = -ENOMEM;
+			goto err_free_bufs;	/* loop-frees gbl_buf[0..i-1] */
+		}
 	}
 
 	/* default_prob_buf — read-only default CDF, initialised from av1_default_cdf[].
@@ -1495,7 +1525,7 @@ static int rkvdec_vdpu383_av1_start(struct rkvdec_ctx *ctx)
 
 		ret = rkvdec_link_alloc_table(&av1_ctx->link_table, rkvdec->dev,
 					      &rkvdec_link_vdpu383_info,
-					      /* task_capacity */ 16);
+					      /* task_capacity */ AV1_LINK_TASK_CAP);
 		if (ret)
 			goto err_free_bufs;
 		ctx->link_table = &av1_ctx->link_table;
@@ -1815,7 +1845,7 @@ static void vdpu383_av1_config_global_hdr(
 	int num_tge)
 {
 	struct vdpu383_av1_gbl_packer bp = {
-		.buf = (__le64 *)av1_ctx->gbl_buf.cpu,
+		.buf = (__le64 *)av1_ctx->gbl_buf[av1_ctx->cur_link_slot].cpu,
 		.idx = 0,
 	};
 	bool is_intra = (fp->frame_type == V4L2_AV1_KEY_FRAME) ||
@@ -1829,7 +1859,7 @@ static void vdpu383_av1_config_global_hdr(
 
 	(void)ctx;	/* reserved for future ref-frame DPB dimension lookups */
 
-	memset(av1_ctx->gbl_buf.cpu, 0, VDPU383_AV1_GBL_SIZE);
+	memset(av1_ctx->gbl_buf[av1_ctx->cur_link_slot].cpu, 0, VDPU383_AV1_GBL_SIZE);
 
 	enable_cdef = !coded_lossless &&
 		      (fp->cdef.bits ||
@@ -2471,7 +2501,8 @@ static void vdpu383_av1_config_addr_regs(
 
 	/* ---- Global header ---- */
 	av1_w(sink, AV1R_GBL_LEN, VDPU383_AV1_GBL_LEN);
-	av1_w(sink, AV1R_GBL_BASE, lower_32_bits(av1_ctx->gbl_buf.dma));
+	av1_w(sink, AV1R_GBL_BASE,
+	      lower_32_bits(av1_ctx->gbl_buf[av1_ctx->cur_link_slot].dma));
 
 	/* Session 25 part 5: pre-zero reg64 and reg71-106 to match MPP's
 	 * memset of the whole comm_paras struct.  Reg65-70 are set explicitly
@@ -2855,6 +2886,33 @@ module_param(av1_cache_clr, int, 0644);
 MODULE_PARM_DESC(av1_cache_clr, "AV1 clear decoder cache(s) pre-kick (0=off,1=CACHE0,2=all3) — partial-decode probe");
 
 /*
+ * 2026-06-24 — the CORRECT cache config, in the dedicated "cache" window.
+ * av1_cache_clr above wrote to rkvdec->regs(function)+0x41x = phys 0x27b00510,
+ * the function-window tail, NOT the cache registers (mainline never mapped the
+ * "cache" resource). MPP's rwmmio trace (.103) writes the read-cache config to
+ * the cache window every decode: cache+0x1c/0x5c/0x9c=0x13 (cfg), +0x10/0x50/
+ * 0x90=0x1 (clear), +0x18=0x1c (max reads). This writes EXACTLY that to
+ * rkvdec->cache. Hypothesis: an unconfigured read-cache is the per-decode
+ * transient-then-converge non-determinism (MPP is byte-deterministic 5/5).
+ * Additive, default off; needs the cache window mapped (rkvdec->cache).
+ */
+static int av1_cache_win;
+module_param(av1_cache_win, int, 0644);
+MODULE_PARM_DESC(av1_cache_win, "AV1 faithful read-cache config in the cache window pre-kick (0=off,1=on) - determinism fix");
+
+/*
+ * 2026-06-24 — capture per-frame AV1 V4L2 controls to /root/av1.ctrls for the
+ * pipelining link-client (the ring test gst can't drive). Mirrors VP9's
+ * vp9_dump_ctrls but file-based (frame ctrl is 1784 B, over the printk limit)
+ * and dumps all 4 controls. Per frame, four TLVs: [type:u32][len:u32][bytes],
+ * type 0=SEQUENCE(12) 1=FRAME(1784) 2=TILE_GROUP_ENTRY(16*n) 3=FILM_GRAIN(194).
+ * The client reads 4 TLVs = one frame. Default off.
+ */
+static int av1_dump_ctrls;
+module_param(av1_dump_ctrls, int, 0644);
+MODULE_PARM_DESC(av1_dump_ctrls, "AV1 capture per-frame V4L2 controls to /root/av1.ctrls (0=off,1=on) - link-client capture");
+
+/*
  * 2026-06-08 Nicolas (lore) follow-up, applied to AV1: dump the intra-above-row
  * RCB (slot 4 = RCB_INTRA_IN_ROW / reg148) so an ours-vs-MPP content diff is
  * possible. Unlike H.264's filterd slot (HW output, overwritten), AV1 slot 4 IS
@@ -2906,6 +2964,21 @@ static int av1_tlb_flush;
 module_param(av1_tlb_flush, int, 0644);
 MODULE_PARM_DESC(av1_tlb_flush, "AV1: iommu_flush_iotlb_all before each kick (0=off, 1=on)");
 
+/*
+ * 2026-06-25 — VDPU383 IP soft-reset before each decode (the reset MPP's
+ * rkvdec_vdpu383_reset does; our mainline driver never resets the IP, relying
+ * only on the PD power cycle). Tests the "stale HW/MMU state -> wrong output"
+ * lead from the BSP-vs-mainline environment diff (AV1_ENVIRONMENT_DIFF_2026-06-25):
+ * disable IRQ, IP soft-reset (ip_reset_base/en), poll the reset-ready bit
+ * (status 0x800), clear, re-enable IRQ. Uses our own link registers only.
+ * Test via av1-link-client at DEPTH=1 (per-frame reset breaks a depth>1 ring).
+ * Default off. NB: this is the IP reset only; the full CRU reset + the IOMMU
+ * mmu-reset (disable-mmu-reset) are DT/reset-framework changes — see the doc.
+ */
+static int av1_ip_reset;
+module_param(av1_ip_reset, int, 0644);
+MODULE_PARM_DESC(av1_ip_reset, "AV1: VDPU383 IP soft-reset before each decode (0=off,1=on) - stale-HW-state probe, use depth=1");
+
 /* 2026-06-10 — the BSP link descriptor (rkvdec2_link_prepare) sets an "error mode
  * flag" we never set: reg13 |= BIT(18)|BIT(9) and reg12 |= BIT(7) (RKVDEC_WAIT_RESET_EN).
  * WAIT_RESET_EN should make the HW wait/reset on a transient error instead of hanging —
@@ -2922,6 +2995,15 @@ MODULE_PARM_DESC(av1_errmode, "AV1 BSP error-mode flag: 1=reg12 WAIT_RESET_EN, 2
 static int av1_regdump;
 module_param(av1_regdump, int, 0644);
 MODULE_PARM_DESC(av1_regdump, "AV1 dump ctrl_crc/addr_crc of HW regs pre-kick; 0=off");
+
+/* 2026-06-24 — zero the RCB scratch (HW row-store, carries previous-frame state
+ * per the av1_rcb_dump comment) before each decode. Tests whether the per-decode
+ * AV1 non-determinism (frame 0 differs every decode in single-shot) is a
+ * stale-buffer read: if zeroing makes frame 0 deterministic -> stale-read;
+ * if still random -> a HW race/metastable latch below the buffers. */
+static int av1_zero_rcb;
+module_param(av1_zero_rcb, int, 0644);
+MODULE_PARM_DESC(av1_zero_rcb, "AV1 zero RCB scratch before each decode (0=off) - determinism probe");
 
 static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 {
@@ -2960,6 +3042,32 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 		av1_rcb_run++;
 	}
 
+	/* 2026-06-24 placement probe (run-path; av1_start logging didn't surface):
+	 * dump per-session scratch DMA addresses, constant within a session, to
+	 * correlate physical placement with the per-decode attractor across loads. */
+	if (av1_addr_log) {
+		dma_addr_t rcb0 = (ctx->rcb_config && ctx->rcb_config->rcb_count)
+			? ctx->rcb_config->rcb_bufs[0].dma : 0;
+
+		pr_info("rkvdec-av1 placement: gbl=%pad cdf0=%pad colmv_cur=%pad colmv_ref0=%pad rcb0=%pad\n",
+			&av1_ctx->gbl_buf[0].dma, &av1_ctx->cdf_segid[0].dma,
+			&av1_ctx->colmv_cur.dma, &av1_ctx->colmv_ref[0].dma,
+			&rcb0);
+	}
+
+	/* Determinism probe: zero RCB scratch before decode (see param desc).
+	 * rcb_bufs[i].cpu is CPU-mapped contiguous (the dump above reads it);
+	 * skip the packed/SRAM split to stay clear of the gen_pool vaddr path. */
+	if (av1_zero_rcb && ctx->rcb_config && !ctx->rcb_config->packed) {
+		struct rkvdec_rcb_config *rcb = ctx->rcb_config;
+		size_t ri;
+
+		for (ri = 0; ri < rcb->rcb_count; ri++)
+			if (rcb->rcb_bufs[ri].cpu)
+				memset(rcb->rcb_bufs[ri].cpu, 0,
+				       rcb->rcb_bufs[ri].size);
+	}
+
 	seq = rkvdec_get_ctrl(ctx, V4L2_CID_STATELESS_AV1_SEQUENCE);
 	fp  = rkvdec_get_ctrl(ctx, V4L2_CID_STATELESS_AV1_FRAME);
 	if (WARN_ON(!seq || !fp))
@@ -2971,6 +3079,82 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 
 	is_intra = (fp->frame_type == V4L2_AV1_KEY_FRAME) ||
 		   (fp->frame_type == V4L2_AV1_INTRA_ONLY_FRAME);
+
+	/* Capture the 4 V4L2 controls for the pipelining link-client (ring test). */
+	if (av1_dump_ctrls) {
+		struct file *cf = filp_open("/root/av1.ctrls",
+					    O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+		if (!IS_ERR(cf)) {
+			loff_t pos = 0;
+			u32 tge_bytes = (u32)num_tge * sizeof(*tge);
+			u32 hdr[2];
+
+			hdr[0] = 0; hdr[1] = sizeof(*seq);
+			kernel_write(cf, hdr, 8, &pos);
+			kernel_write(cf, seq, sizeof(*seq), &pos);
+			hdr[0] = 1; hdr[1] = sizeof(*fp);
+			kernel_write(cf, hdr, 8, &pos);
+			kernel_write(cf, fp, sizeof(*fp), &pos);
+			hdr[0] = 2; hdr[1] = tge_bytes;
+			kernel_write(cf, hdr, 8, &pos);
+			if (tge_bytes)
+				kernel_write(cf, tge, tge_bytes, &pos);
+			hdr[0] = 3; hdr[1] = fg ? sizeof(*fg) : 0;
+			kernel_write(cf, hdr, 8, &pos);
+			if (fg)
+				kernel_write(cf, fg, sizeof(*fg), &pos);
+
+			/* type 4: the raw V4L2 source bitstream gst fed (the
+			 * OBU_FRAME body — the driver re-synthesises framing). The
+			 * src has no CPU mapping, so resolve IOVA->phys + memremap
+			 * like the decode path (src is dma-contig = phys-contig). */
+			{
+				dma_addr_t sdma = vb2_dma_contig_plane_dma_addr(
+						&src->vb2_buf, 0);
+				u32 slen = vb2_get_plane_payload(&src->vb2_buf, 0);
+				struct iommu_domain *dom =
+					iommu_get_domain_for_dev(rkvdec->dev);
+				phys_addr_t sphys = dom ?
+					iommu_iova_to_phys(dom, sdma) : 0;
+				void *scpu = (sphys && slen) ?
+					memremap(sphys, slen, MEMREMAP_WB) : NULL;
+
+				hdr[0] = 4; hdr[1] = slen;
+				kernel_write(cf, hdr, 8, &pos);
+				if (scpu) {
+					kernel_write(cf, scpu, slen, &pos);
+					memunmap(scpu);
+				}
+			}
+			filp_close(cf, NULL);
+		}
+	}
+
+	/* VDPU383 IP soft-reset before decode (stale-HW-state probe; see param). */
+	if (av1_ip_reset && rkvdec_link_mode && ctx->link_table) {
+		const struct rkvdec_link_info *info = av1_ctx->link_table.info;
+		void __iomem *lb = rkvdec->link;
+		int i;
+
+		writel(info->ip_en_val | BIT(15), lb + info->ip_en_base);
+		writel(info->ip_reset_en, lb + info->ip_reset_base);
+		for (i = 0; i < 200; i++) {
+			if (readl(lb + info->status_base) & 0x800)
+				break;
+			udelay(1);
+		}
+		writel(0xffff0000u, lb + info->irq_base);
+		writel(0xffff0000u, lb + info->status_base);
+		writel(info->ip_en_val, lb + info->ip_en_base);
+	}
+
+	/* Pin this frame's per-task buffer slot (gbl_buf[]) for the whole run.
+	 * Link mode: the descriptor-ring slot we will fill+enqueue below
+	 * (next_slot — unchanged until the enqueue advances it). Single-shot: 0.
+	 * MUST be set before config_global_hdr / config_addr_regs touch gbl_buf. */
+	av1_ctx->cur_link_slot = (rkvdec_link_mode && ctx->link_table)
+		? av1_ctx->link_table.next_slot : 0;
 
 	/* Always allocate a fresh write-back slot.  For INTER frames the
 	 * READ source is determined in config_addr_regs() via
@@ -3031,6 +3215,21 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 			writel(0x1u, rkvdec->regs + 0x490);        /* CLR_CACHE2 */
 		}
 		writel(0x1cu, rkvdec->regs + 0x418);               /* MAX_READS */
+		wmb();
+	}
+
+	/* 2026-06-24 faithful read-cache config in the dedicated cache window,
+	 * byte-matching MPP's per-decode rwmmio trace (.103). Offsets are relative
+	 * to rkvdec->cache (phys 0x27b00600): clear+config all 3 caches + set max
+	 * outstanding reads. The order mirrors MPP: cfg, then clear, then max. */
+	if (av1_cache_win && rkvdec->cache) {
+		writel(0x1u | 0x2u | 0x10u, rkvdec->cache + 0x1c); /* CACHE0 cfg */
+		writel(0x1u | 0x2u | 0x10u, rkvdec->cache + 0x5c); /* CACHE1 cfg */
+		writel(0x1u | 0x2u | 0x10u, rkvdec->cache + 0x9c); /* CACHE2 cfg */
+		writel(0x1u, rkvdec->cache + 0x10);                /* CLR_CACHE0 */
+		writel(0x1u, rkvdec->cache + 0x50);                /* CLR_CACHE1 */
+		writel(0x1u, rkvdec->cache + 0x90);                /* CLR_CACHE2 */
+		writel(0x1cu, rkvdec->cache + 0x18);               /* MAX_READS */
 		wmb();
 	}
 
@@ -3111,10 +3310,19 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 		 * curr_ctx, so the reap (watchdog/IRQ) finds the owner here. */
 		rkvdec->link_ctx = ctx;
 
-		/* No single-shot LINK_INT_EN arm here (fix #2): BSP's link
-		 * enqueue never writes INT_EN — the link IRQ is the raw BIT(9)
-		 * serviced by the link IRQ handler. rkvdec_link_enqueue_vdpu383
-		 * + the watchdog backstop drive completion. */
+		/* Enable the link frame-done IRQ before the kick.
+		 *
+		 * 2026-06-23 (MPP rwmmio trace, .104): BSP's link *enqueue* never
+		 * writes INT_EN — but BSP enables the link IRQ ONCE at probe, and
+		 * per task it re-arms via IP_EN(0x58)=0x1000000. Our port has no
+		 * probe-time link-IRQ enable, so M1 fix #2 (dropping the per-enqueue
+		 * arm "to match BSP's enqueue") left the link IRQ *disabled* in the
+		 * link path — the HW completes but raises no IRQ (the depth-1
+		 * SILENT). Re-arm here so the threaded link IRQ handler runs and
+		 * reaps via the per-descriptor writeback; the watchdog below stays
+		 * as the backstop. */
+		writel(FIELD_PREP_WM16(VDPU383_INT_EN_IRQ, VDPU383_INT_EN_IRQ),
+		       rkvdec->link + VDPU383_LINK_INT_EN);
 
 		/*
 		 * Arm the watchdog as the reap backstop. CRITICAL for AV1: the

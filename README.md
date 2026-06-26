@@ -5,54 +5,44 @@ A working **V4L2 stateless VP9 decoder** for the Rockchip **RK3576** SoC's
 10-bit VP9 (Profile 0 and Profile 2) correctly and well above real-time, built
 on top of the now-mainline VDPU383 H.264/H.265 `rkvdec` infrastructure.
 
-**One outstanding bug** affects VP9 inter frames with a *small motion-compensation
-footprint* (small/skip-heavy or sub-128px frames): their reference pixels come
-from a retained internal copy of the most-recent reference instead of the
-reference at the programmed DRAM address. It is a hardware-execution-level
-question we cannot resolve from the driver side. This repo is published
-downstream-first: working code plus a precise, fully-triaged question for the
-people with the hardware documentation (Collabora / the VDPU383 maintainers). See
-[The reference-bypass bug](#the-reference-bypass-bug-the-open-question).
+**One outstanding bug** affects VP9 **inter** frames on certain content. After
+exhaustive triage it is established to be a **hardware-internal divergence below the
+register interface**: every programmable input is byte-identical to the vendor
+library (MPP), yet MPP on the *same* VDPU383 silicon decodes the same streams
+**bit-exact to the libvpx/ffmpeg software reference** while our V4L2 stack does not.
+It is not resolvable from the driver side. This repo is published downstream-first:
+working code plus a precise, fully-triaged question for the people with the hardware
+documentation (Collabora / the VDPU383 maintainers). See
+[The open bug](#the-open-bug-below-the-register-interface).
 
-> Status as of 2026-06-16. Independent development on the RK3576 VDPU383.
->
-> **Correction (2026-06-13):** earlier revisions framed the open bug as
-> *compound-prediction-specific* ("SELECT frames collapse to an alt-ref copy").
-> That was wrong — compound prediction works (fresh alt-ref clips decode
-> byte-exact), and the bug also hits **single-reference** frames. The real factor
-> is a small MC footprint, not compound mode; what were described as two bugs (the
-> "compound bug" and a "small-dimension single-ref inter bug") are one. See
-> [`docs/REF_BYPASS_BUG.md`](docs/REF_BYPASS_BUG.md).
->
-> **Update (2026-06-26) — exhaustively triaged as below-MMIO; symmetric with AV1.**
-> Two further results harden the "below the register interface" conclusion:
-> 1. **It is genuinely our-driver-wrong, not a silicon limit.** MPP, on the *same*
->    VDPU383 silicon, decodes the failing clip **bit-exact to the ffmpeg/libvpx
->    software reference** (verified on a md5-identical file: MPP vs ffmpeg = 0.000;
->    ours = 0.346 on the first INTER frame). The hardware *can* do it; our V4L2
->    stack produces different pixels.
-> 2. **A second manifestation:** beyond the gross reference-bypass on tiny frames,
->    complex / high-q INTER content shows a subtle **sub-pel-precision** drift that
->    cascades through references — same wall, different surface.
->
-> We then replicated MPP's decode path in our driver to the byte: identical register
-> file (`ctrl_regs` + `comm_paras` 0-diff via offsetof field-map), byte-identical
-> stream bytes the HW reads, config delivered via the **DRAM-descriptor HW-fetch**
-> path (not MMIO), a submission sequence **identical to the working HEVC backend**,
-> and a **continuously-armed link ring** (HW armed across KEY→INTER, no disarm —
-> append branch confirmed firing). Every one tested; output still wrong. The AV1
-> sibling reached the identical wall independently.
-> 3. **The last open lead — per-frame PM/IOMMU/clock cycling — is now refuted
->    (2026-06-27).** Forcing genuine per-frame suspend→resume cycles (IOMMU re-init +
->    clock off/on + warmup, ftrace-confirmed landing *between* KEY and the first INTER
->    frame, escalated up to 12 cycles) changed nothing — byte-identical wrong output
->    (VP9) and 0/39 exact (AV1). Operation-class coverage is complete: our driver
->    exercises every clock / IOMMU / reset / PM / warmup operation class MPP does. And
->    the decisive observation — **the decode starts correct and diverges mid-frame**
->    (AV1 frame 0's first 16 bytes are byte-exact to the reference, yet its Y-MAE is
->    ~90): the hardware gets correct inputs, begins decoding correctly, and diverges
->    during its own internal pass. Below-MMIO by definition; the investigation is
->    terminal. See [`docs/REF_BYPASS_BUG.md`](docs/REF_BYPASS_BUG.md).
+## Status
+
+The driver decodes 8-bit and 10-bit VP9 (Profiles 0 and 2) at all resolutions to
+4K, well above real-time. The one correctness gap is VP9 **inter** decode, which
+fails on two kinds of content — both traced to the *same* hardware-internal wall:
+
+- **Reference-bypass on small-MC-footprint frames** (sparse/skip-heavy *or*
+  sub-128px): the frame reconstructs from a retained internal copy of the
+  most-recent reference instead of the reference at the programmed DRAM address.
+- **Sub-pel-precision drift on complex / high-q inter frames**: a subtle per-frame
+  error that cascades through references.
+
+Both were triaged to exhaustion and converge on one conclusion: the bug is below
+the MMIO register interface, in the hardware's internal execution. Every
+programmable input is byte-identical to MPP — the register file (`ctrl_regs` +
+`comm_paras`, 0-diff via the offsetof field-map), the GBL header, the full
+entropy-probability buffer, and the stream bytes the hardware reads. Config reaches
+the hardware the same way MPP delivers it (verified down to the DRAM-descriptor
+fetch path); the submission sequence is identical to the *working* HEVC backend; and
+a continuously-armed link ring plus the complete per-frame clock / IOMMU / reset /
+PM / warmup operation set were replicated from MPP. The output is still wrong, while
+MPP — same silicon, same frame — is bit-exact. The decode even **starts** correct
+(on the AV1 sibling, frame 0's first 16 bytes are byte-exact to the reference) and
+diverges *during* the hardware's own internal pass. There is no remaining
+driver-side input or operation that changes the result; the investigation is
+**terminal** from the driver side. The sibling **AV1** decoder
+(`rkvdec-vdpu383-av1`) reached the identical wall independently — this is one
+hardware-internal issue across both VDPU383 codecs.
 
 ---
 
@@ -163,12 +153,18 @@ the `flush-only-after-restore` optimisation).
 
 ---
 
-## The reference-bypass bug (the open question)
+## The open bug (below the register interface)
 
 **This is the centrepiece.** Full triage in
-[`docs/REF_BYPASS_BUG.md`](docs/REF_BYPASS_BUG.md); summary here.
+[`docs/REF_BYPASS_BUG.md`](docs/REF_BYPASS_BUG.md); summary here. The deepest-
+characterised manifestation is the **reference-bypass** on small-MC-footprint
+frames (detailed below); the **sub-pel-precision drift** on complex/high-q frames
+is the same wall on a different surface, and both were proven to sit below the MMIO
+register interface (every input byte-identical to MPP, every operation class
+replicated, the decode starts correct and diverges internally — see *Status* above
+and `docs/REF_BYPASS_BUG.md` §7).
 
-### Symptom
+### Symptom (reference-bypass manifestation)
 
 A VP9 **inter** frame with a small motion-compensation footprint reconstructs
 using a **retained internal copy of the most-recently-used reference** instead of
@@ -224,14 +220,17 @@ large-frame compound-free content is perfect.
 
 ### The ask
 
-The reference addresses we program are correct and identical in construction to
-the working HEVC path, yet for small-MC-footprint VP9 inter frames the HW
-reconstructs from a retained internal copy of the most-recent reference instead of
-those addresses, while MPP (same silicon, same frame) fetches them. **On VDPU383,
-what in the VP9 reconstruction / motion-comp path arms a real DRAM reference
-fetch, and why is it disarmed for small-footprint frames — given H.264/HEVC small
-frames are unaffected and our addresses match the working HEVC path?** A pointer
-to where VP9 MC reference fetch differs from HEVC on this IP would be decisive.
+Every programmable input is byte-identical to MPP, every clock / IOMMU / reset /
+PM / warmup operation class MPP performs is replicated, the submission sequence
+matches the working HEVC backend, and the decode *starts* correct — yet for
+small-MC-footprint VP9 inter frames the hardware reconstructs from a retained
+internal copy of the most-recent reference instead of the programmed DRAM address,
+while MPP (same silicon, same frame) fetches it. **On VDPU383, what internal
+per-frame state or init step does VP9 (and AV1) inter decode require that H.264 and
+HEVC do not — that arms a real DRAM reference fetch (and, more generally, keeps the
+internal decode on-track past the start of the frame) — given our inputs and
+operation set match MPP yet ours diverges and MPP is bit-exact?** A pointer to
+where the VP9/AV1 inter path differs from HEVC on this IP would be decisive.
 
 ---
 

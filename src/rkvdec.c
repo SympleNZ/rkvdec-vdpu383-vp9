@@ -23,6 +23,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
+#include <linux/reset.h>
 #include <linux/slab.h>
 #include <linux/videodev2.h>
 #include <linux/workqueue.h>
@@ -221,6 +222,41 @@ int r42_irq_settle_us = 0;
 module_param(r42_irq_settle_us, int, 0644);
 MODULE_PARM_DESC(r42_irq_settle_us,
 		 "R42: usleep_range (us) in vp9_run pre-kick for HW state-settle (default 0 - no clear win)");
+
+/*
+ * 2026-06-24 link_irq_poll_us — bounded inline writeback-settle poll in the
+ * link IRQ reap. AV1-SPECIFIC band-aid, NOT a codec-general throughput lever
+ * (see the 2026-06-24 measurement notes below).
+ *
+ * For AV1 the VDPU383 raises the link IRQ slightly AHEAD of the per-task
+ * descriptor writeback DMA landing in the (coherent) link table, so the reap
+ * in rkvdec_irq_handler usually finds the tail slot still un-written and leaves
+ * the task for the 10 ms watchdog poll (RKVDEC_WATCHDOG_POLL_MS): allintra
+ * depth=1 reaps ~1/39 by IRQ, ~38/39 by the watchdog. When >0 we spin a bounded
+ * settle-poll (threaded-IRQ ctx, may sleep), re-reaping as each straggler's
+ * writeback lands, bailing once a tail makes no progress for idle_max steps (an
+ * error/append-disturbed writeback that needs the watchdog reset+RESEND).
+ *
+ * IMPORTANT SCOPE (2026-06-24 A/B on .165):
+ *  - This ordering race is AV1-ONLY. HEVC and H264 reap with real_to=0 at
+ *    depth=1 (writeback present at IRQ time) — they get no benefit and the
+ *    poll is a no-op for them. The race tracks the below-MMIO-bug codecs.
+ *  - For AV1 it helps depth=1 (real_to/elapsed roughly halve) but the signal
+ *    is confounded by AV1 metastability (same config swings 3-8 s), and it
+ *    HURTS depth>1 (the spin disturbs the append/batch timing -> reset churn).
+ *  - It does NOT make our link mode beat single-shot. Our link mode is
+ *    finish-at-submit per-frame, mechanically ==/worse than single-shot
+ *    (H264: lm=0 0.43 s vs lm=1 0.55 s vs depth=4 1.14 s). MPP's ~2.3-3x is a
+ *    genuine batch-only continuous ring we have NOT built; flipping link_mode
+ *    on does not realize it.
+ *
+ * Additive: default 0 == prior watchdog-only behaviour. Kept default-off as an
+ * AV1 latency knob + the empirical proof of the AV1 writeback ordering race.
+ */
+int link_irq_poll_us;
+module_param(link_irq_poll_us, int, 0644);
+MODULE_PARM_DESC(link_irq_poll_us,
+		 "Bounded inline link-IRQ writeback-settle poll budget in us (0=off/watchdog-only, default 0)");
 
 /*
  * 2026-06-05 throughput experiment — hardirq top-half + WQ_HIGHPRI
@@ -438,6 +474,33 @@ int r47_link_barrier_strong;
 module_param(r47_link_barrier_strong, int, 0644);
 MODULE_PARM_DESC(r47_link_barrier_strong,
 		 "R47: stronger barrier before link CFG_DONE (readl drain + mb) (0=off, 1=on)");
+
+/*
+ * 2026-06-24 Lead A — warmup as a PURE register pulse (MPP-faithful) instead of
+ * a real warmup decode. MPP's rkvdec2_runtime_resume (rwmmio trace .103) writes
+ * 13 link registers with 0x04=0xfffff000 (constant, NOT a descriptor) and does
+ * NO decode / NO status poll. Our rkvdec_rk3576_warmup_run runs a real decode
+ * (0x04=descriptor, CFG_DONE, 21ms poll), which may leave different residual HW
+ * state — the suspected seed of the AV1 per-decode attractor lottery. =1 makes
+ * the warmup match MPP's pulse exactly. Default 0 = the validated warmup-decode
+ * (which was the H.264 deblock cure — A/B AV1 determinism AND H.264 together).
+ */
+int warmup_pulse;
+module_param(warmup_pulse, int, 0644);
+MODULE_PARM_DESC(warmup_pulse,
+		 "Warmup = MPP-faithful pure register pulse (0x04=0xfffff000, no decode/poll) instead of a warmup decode (0=off/decode, 1=pulse)");
+
+/*
+ * 2026-06-25 — CRU reset on every runtime_resume (the reset MPP does and our
+ * mainline driver does not). rwmmio trace .103: rkvdec2_runtime_resume path
+ * asserts+deasserts a CRU softrst. We have NO reset_control at all. Assert +
+ * deassert all DT reset lines (axi/ahb/cabac/core/hevc_cabac) after clk enable,
+ * before the warmup. Gated, default off. Test with av1_cache_win=1 (deterministic
+ * baseline) via gst — does the decode flip from beaa2f to the f7d06010 reference?
+ */
+int rkvdec_cru_reset;
+module_param(rkvdec_cru_reset, int, 0644);
+MODULE_PARM_DESC(rkvdec_cru_reset, "Assert+deassert the CRU reset lines on each runtime_resume (0=off,1=on) - MPP-parity reset probe");
 
 static struct dma_chan *vp9_bug_a_chan;
 static bool vp9_bug_a_phase3_attempted;
@@ -3501,6 +3564,32 @@ static irqreturn_t rkvdec_irq_handler(int irq, void *priv)
 		writel(0xffff0000u, rkvdec->link + 0x48);
 		writel(0xffff0000u, rkvdec->link + 0x4c);
 		rkvdec_link_reap_writeback(ctx);
+
+		/*
+		 * 2026-06-24 throughput lever: the writeback for the task this
+		 * IRQ signals often hasn't DMA-landed yet when the reap above
+		 * runs (HW raises the link IRQ ahead of the descriptor write).
+		 * Rather than leave it for the 10 ms watchdog poll, spin a
+		 * bounded settle-poll here (threaded IRQ ctx — may sleep),
+		 * re-reaping as stragglers land. Bail once a tail stops making
+		 * progress (error/append-disturbed writeback that needs the
+		 * watchdog reset+RESEND). Additive — link_irq_poll_us=0 skips it.
+		 */
+		if (link_irq_poll_us > 0 && rkvdec_inflight_depth(ctx) > 0) {
+			const int step_us = 10;	/* poll granularity */
+			const int idle_max = 8;	/* ~80 us no-progress -> give up */
+			int waited = 0, idle = 0;
+
+			while (waited < link_irq_poll_us &&
+			       rkvdec_inflight_depth(ctx) > 0) {
+				udelay(step_us);
+				waited += step_us;
+				if (rkvdec_link_reap_writeback(ctx) > 0)
+					idle = 0;
+				else if (++idle >= idle_max)
+					break;
+			}
+		}
 		return IRQ_HANDLED;
 	}
 
@@ -4221,6 +4310,16 @@ static int rkvdec_probe(struct platform_device *pdev)
 	rkvdec->num_clocks = ret;
 	rkvdec->axi_clk = devm_clk_get(&pdev->dev, "axi");
 
+	/* CRU reset lines (optional; used only when rkvdec_cru_reset is set). */
+	rkvdec->resets[0].id = "axi";
+	rkvdec->resets[1].id = "ahb";
+	rkvdec->resets[2].id = "cabac";
+	rkvdec->resets[3].id = "core";
+	rkvdec->resets[4].id = "hevc_cabac";
+	rkvdec->has_resets =
+		!devm_reset_control_bulk_get_optional_exclusive(&pdev->dev, 5,
+								rkvdec->resets);
+
 	if (rkvdec->variant->has_single_reg_region) {
 		rkvdec->regs = devm_platform_ioremap_resource(pdev, 0);
 		if (IS_ERR(rkvdec->regs))
@@ -4233,6 +4332,18 @@ static int rkvdec_probe(struct platform_device *pdev)
 		rkvdec->link = devm_platform_ioremap_resource_byname(pdev, "link");
 		if (IS_ERR(rkvdec->link))
 			return PTR_ERR(rkvdec->link);
+
+		/*
+		 * Dedicated read-cache window (DT reg-name "cache"). Optional:
+		 * NULL if absent so we don't regress variants without it. MPP
+		 * configures/clears the read caches here every decode (see
+		 * rkvdec_dev::cache).
+		 */
+		rkvdec->cache = devm_platform_ioremap_resource_byname(pdev, "cache");
+		if (IS_ERR(rkvdec->cache))
+			rkvdec->cache = NULL;
+		dev_info(&pdev->dev, "rkvdec: cache window %s\n",
+			 rkvdec->cache ? "mapped" : "ABSENT");
 	}
 
 	ret = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
@@ -4521,6 +4632,17 @@ static int rkvdec_runtime_resume(struct device *dev)
 	ret = clk_bulk_prepare_enable(rkvdec->num_clocks, rkvdec->clocks);
 	if (ret)
 		return ret;
+
+	/*
+	 * 2026-06-25 — CRU reset (MPP does this in rkvdec2_runtime_resume; we
+	 * never did). Assert + deassert all reset lines after clk-on, before the
+	 * warmup. Gated by rkvdec_cru_reset (default off).
+	 */
+	if (rkvdec_cru_reset && rkvdec->has_resets) {
+		reset_control_bulk_assert(5, rkvdec->resets);
+		udelay(10);
+		reset_control_bulk_deassert(5, rkvdec->resets);
+	}
 
 	/*
 	 * R35 (2026-06-01) — re-run the BSP RK3576 HW warmup on every
