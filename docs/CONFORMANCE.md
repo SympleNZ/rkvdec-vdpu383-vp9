@@ -1,5 +1,19 @@
 # VP9 conformance tail — accurately characterized (2026-06-05)
 
+> **Correction (2026-06-28) — read this first.** The "reference-bypass" naming and
+> especially the **"vendor / below-MMIO"** attribution used throughout this doc are
+> **superseded and were wrong on the silicon question.** Building the vendor MPP
+> decoder out-of-tree on the *same* mainline kernel/DT/silicon proved the failure is
+> a **driver bug, not silicon** (MPP is bit-exact on the same hardware). The headline
+> correctness gap is **VP9 compound prediction** (`reference_mode = SELECT`),
+> established to be an internal compound-MC divergence **below every V4L2-touchable
+> interface** — driver-addressable in principle, but not fixable through the mainline
+> V4L2 interface (every control register is byte-identical to MPP). The small-dimension
+> single-ref `size`-cluster failures below are a related small-MC-footprint stressor
+> (real content ≥128px is bit-exact). The authoritative final write-up is the main
+> [`README.md`](../README.md) ("VP9 compound prediction"); the per-cluster data below
+> remains valid — only the "vendor/below-MMIO silicon" framing is retired.
+
 > **Correction (2026-06-13):** this doc originally treated the small-dimension
 > single-ref inter failure as a *distinct* bug from the "compound bug." They are
 > **the same bug** — the small-MC-footprint reference-bypass in

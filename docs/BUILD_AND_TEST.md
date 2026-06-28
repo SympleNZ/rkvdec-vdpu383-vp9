@@ -69,8 +69,8 @@ Notes:
 ```sh
 python3 fluster.py run -d GStreamer-VP9-V4L2SL -ts VP9-TEST-VECTORS -j1
 # Current: 148/305 strict-MD5. See CONFORMANCE.md for the per-cluster breakdown
-# (the bulk of the misses are the reference-bypass bug — small-footprint inter
-#  frames, REF_BYPASS_BUG.md — plus downstream gst/comparator).
+# (the misses are dominated by the VP9 compound-prediction gap (below the V4L2
+#  interface; see README) + small-dimension size stressors, plus downstream gst/comparator.)
 ```
 
 **Reboot before a fresh baseline** — decoder/HW state bleeds across runs and can
