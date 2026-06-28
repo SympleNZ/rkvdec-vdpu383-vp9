@@ -2,6 +2,8 @@
 /*
  * Rockchip Video Decoder AV1 driver for VDPU383 (RK3576)
  *
+ * Copyright (C) 2026 Symple Solutions Ltd.
+ * Author: Simon <simon@symple.nz>
  *
  * Register programming adapted from Rockchip MPP hal_av1d_vdpu383.c
  * and hal_av1d_com.c.  GBL buffer bit layout documented in

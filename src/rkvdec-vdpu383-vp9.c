@@ -2,6 +2,8 @@
 /*
  * Rockchip Video Decoder VP9 driver for VDPU383 (RK3576)
  *
+ * Copyright (C) 2026 Symple Solutions Ltd.
+ * Author: Simon <simon@symple.nz>
  *
  * Based on rkvdec-vp9.c (RK3399 VP9 backend) by Boris Brezillon.
  * Register programming follows the mainline VDPU383 HEVC/H.264 backends:
