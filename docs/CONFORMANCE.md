@@ -11,7 +11,7 @@
 > "two kernel bugs" / "distinct from the compound bug" phrasings are superseded.
 
 Working through the "remaining open items", I re-examined the Fluster failure
-clusters (`VP9-TEST-VECTORS`, 107/305 pass) by decoding individual vectors and
+clusters (`VP9-TEST-VECTORS`, 148/305 pass) by decoding individual vectors and
 comparing our output to the libvpx (ffmpeg) reference directly — rather than
 trusting Fluster's pass/fail or the prior "it's all downstream comparator noise"
 belief. **That belief was wrong: part of the tail is a real, distinct driver

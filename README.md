@@ -36,7 +36,7 @@ conclusion independently.
 | Mid-stream resolution change | ⚠️ driver signals it correctly; gst-plugins-bad drops frames (downstream) |
 | Profile 3 (4:2:2 / 4:4:4), 12-bit | ❌ unsupported by design |
 
-**Fluster** (`VP9-TEST-VECTORS`, strict MD5): **107/305 (35.2%), zero crashes**,
+**Fluster** (`VP9-TEST-VECTORS`, strict MD5): **148/305 (48.5%), zero crashes**,
 core decode 94–100%. The misses are dominated by small-dimension padding / resize
 stressors and the compound gap, not by core-decode failures.
 
@@ -278,7 +278,7 @@ Conformance (Fluster):
 
 ```sh
 python3 fluster.py run -d GStreamer-VP9-V4L2SL -ts VP9-TEST-VECTORS -j1
-# 107/305 strict-MD5, zero crashes (see docs/CONFORMANCE.md for the breakdown).
+# 148/305 strict-MD5, zero crashes (see docs/CONFORMANCE.md for the breakdown).
 # Reboot before a fresh baseline — decoder state bleeds across runs.
 ```
 
