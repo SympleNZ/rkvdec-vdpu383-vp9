@@ -23,6 +23,7 @@
 extern int rkvdec_link_mode;
 extern int rkvdec_link_depth;
 extern int vp9_time;	/* shared HW decode-time diagnostic gate (rkvdec.c) */
+extern int hevc_cache;	/* HEVC/H.264 read-cache config (throughput); rkvdec.c */
 extern int fbc_enable;	/* FBC reference-compression throughput probe (rkvdec.c) */
 extern int fbc_log;	/* FBC address-layout diagnostic logging (rkvdec.c) */
 
@@ -1282,6 +1283,19 @@ static int rkvdec_h264_run(struct rkvdec_ctx *ctx)
 		wmb();
 	if (h264_kick_flush >= 2 && rkvdec->iommu_domain)
 		iommu_flush_iotlb_all(rkvdec->iommu_domain);
+
+	/* 2026-06-27: configure the VDPU383 read caches like AV1/VP9 and MPP do
+	 * (mainline H.264 ran cache-OFF — the ~5x pure-HW-decode-time gap vs MPP). */
+	if (hevc_cache && rkvdec->cache) {
+		writel(0x1u | 0x2u | 0x10u, rkvdec->cache + 0x1c); /* CACHE0 cfg */
+		writel(0x1u | 0x2u | 0x10u, rkvdec->cache + 0x5c); /* CACHE1 cfg */
+		writel(0x1u | 0x2u | 0x10u, rkvdec->cache + 0x9c); /* CACHE2 cfg */
+		writel(0x1u, rkvdec->cache + 0x10);                /* CLR_CACHE0 */
+		writel(0x1u, rkvdec->cache + 0x50);                /* CLR_CACHE1 */
+		writel(0x1u, rkvdec->cache + 0x90);                /* CLR_CACHE2 */
+		writel(0x1cu, rkvdec->cache + 0x18);               /* MAX_READS */
+		wmb();
+	}
 
 	/* Start decoding! */
 	writel(timeout_threshold, rkvdec->link + VDPU383_LINK_TIMEOUT_THRESHOLD);

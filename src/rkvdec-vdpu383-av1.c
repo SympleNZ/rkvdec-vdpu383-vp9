@@ -1639,12 +1639,26 @@ struct av1_reg_sink {
 	u32		*image;	/* reg_image[256] — link mode; NULL in single-shot */
 };
 
+/* 2026-06-27 runtime MMIO-sequence trace (AV1 driver-bug hunt). Logs every
+ * single-shot register write in MPP's exact DEBUG_SET_REG format
+ * ("write reg[%03d]: %04x: 0x%08x") so a same-board dmesg capture diffs
+ * line-for-line against MPP-on-mainline (mpp_dev_debug=0x3000). Single-shot
+ * only (link mode builds into a descriptor image, not MMIO). Default off. */
+static int av1_mmio_trace;
+module_param(av1_mmio_trace, int, 0644);
+MODULE_PARM_DESC(av1_mmio_trace,
+	"AV1 log full single-shot MMIO register-write sequence, MPP DEBUG_SET_REG format (0=off,1=on)");
+
 static inline void av1_w(const struct av1_reg_sink *s, u32 byte_off, u32 val)
 {
 	if (s->image)
 		s->image[byte_off >> 2] = val;
-	else
+	else {
+		if (av1_mmio_trace)
+			pr_info("write reg[%03d]: %04x: 0x%08x\n",
+				byte_off >> 2, byte_off, val);
 		writel(val, s->mmio + byte_off);
+	}
 }
 
 static void vdpu383_av1_config_common_regs(struct rkvdec_ctx *ctx,
@@ -1705,9 +1719,22 @@ static void vdpu383_av1_config_common_regs(struct rkvdec_ctx *ctx,
 	if (sink->image)
 		memcpy(&sink->image[VDPU383_OFFSET_COMMON_REGS >> 2],
 		       &common, sizeof(common));
-	else
+	else {
 		rkvdec_memcpy_toio(rkvdec->regs + VDPU383_OFFSET_COMMON_REGS,
 				   &common, sizeof(common));
+		/* trace the common-region burst as individual reg writes so the
+		 * sequence diffs against MPP's per-word mpp_write_req trace. */
+		if (av1_mmio_trace) {
+			u32 *w = (u32 *)&common;
+			int i;
+
+			for (i = 0; i < sizeof(common) / 4; i++)
+				pr_info("write reg[%03d]: %04x: 0x%08x\n",
+					(VDPU383_OFFSET_COMMON_REGS >> 2) + i,
+					VDPU383_OFFSET_COMMON_REGS + i * 4,
+					w[i]);
+		}
+	}
 }
 
 /* -----------------------------------------------------------------------
@@ -2076,10 +2103,23 @@ static void vdpu383_av1_config_global_hdr(
 		av1_gbl_put(&bp, fp->cdef.y_pri_strength[i]  & 0xf, 4);
 	for (i = 0; i < 8; i++)
 		av1_gbl_put(&bp, fp->cdef.uv_pri_strength[i] & 0xf, 4);
-	for (i = 0; i < 8; i++)
-		av1_gbl_put(&bp, fp->cdef.y_sec_strength[i]  & 0x3, 2);
-	for (i = 0; i < 8; i++)
-		av1_gbl_put(&bp, fp->cdef.uv_sec_strength[i] & 0x3, 2);
+	/* 2026-06-27: the HW GBL wants the RAW 2-bit cdef secondary strength
+	 * (0..3), but V4L2 stores the spec-remapped value where 3 became 4
+	 * (AV1 §5.9.19 "if (cdef_*_sec_strength == 3) += 1"). A plain & 0x3 turns
+	 * that 4 into 0 (our uv_sec_strength[3]=0 vs MPP's 3 — the only GBL byte
+	 * that differed from MPP, byte 114). Un-remap 4->3 to match MPP. CDEF is
+	 * post-reconstruction so this does NOT fix the entropy desync, but it is
+	 * a real correctness bug on frames using a sec_strength of 4. */
+	for (i = 0; i < 8; i++) {
+		u32 ys = fp->cdef.y_sec_strength[i];
+
+		av1_gbl_put(&bp, (ys == 4 ? 3 : ys) & 0x3, 2);
+	}
+	for (i = 0; i < 8; i++) {
+		u32 uvs = fp->cdef.uv_sec_strength[i];
+
+		av1_gbl_put(&bp, (uvs == 4 ? 3 : uvs) & 0x3, 2);
+	}
 	/* running: 925 bits */
 
 	/* §M — Loop restoration [bits 925–935, 11 bits] */
@@ -2344,6 +2384,12 @@ static void vdpu383_av1_config_global_hdr(
  * layout (captured from .104 mpp_dev_debug) anchored at our RCB block base,
  * WITHOUT touching the shared allocator. 1080p-specific (test on bbb1080_av1).
  */
+/* 2026-06-27: override per-slot RCB size with MPP's exact 352x288 AV1 values
+ * (test hook against the ip_reset deterministic baseline; see config_addr_regs). */
+static int av1_rcb_mpp_sizes;
+module_param(av1_rcb_mpp_sizes, int, 0644);
+MODULE_PARM_DESC(av1_rcb_mpp_sizes, "Override RCB sizes with MPP's exact 352x288 values (test, 0=off/our sizes, 1=on)");
+
 static int av1_mpp_rcb;
 module_param(av1_mpp_rcb, int, 0644);
 MODULE_PARM_DESC(av1_mpp_rcb, "AV1 re-pack RCB byte-exact to MPP 1080p layout (0=off,1=on) — partial-decode probe");
@@ -2363,6 +2409,37 @@ MODULE_PARM_DESC(av1_mpp_rcb, "AV1 re-pack RCB byte-exact to MPP 1080p layout (0
 static int av1_iova_fault;
 module_param(av1_iova_fault, int, 0644);
 MODULE_PARM_DESC(av1_iova_fault, "Point slot-4 INTRA_IN_ROW RCB at an UNMAPPED IOVA sentinel to fault-trace HW above-row-context access (Cat 5.1). 1=on.");
+
+/* 2026-06-27 runtime-trace fix candidate. Same-board descriptor diff vs
+ * MPP-on-mainline (f0 intra frame): MPP leaves ALL reference base/stride
+ * registers ZERO on an intra / no-valid-ref frame, while our loop falls back
+ * to pointing each "reference" at the CURRENT output buffer (with valid
+ * strides). The HW then treats a partially-written self-reference as a live
+ * reference and reads it mid-decode -> run-to-run-varying post-SB0 corruption
+ * (the AV1 coin-flip). When set, skip programming any reference whose
+ * timestamp is 0 / DPB slot invalid, leaving its regs at the pre-zeroed 0
+ * (MPP-faithful). */
+/* Default ON (2026-06-27, faithful-accumulation): MPP leaves absent references
+ * all-zero on intra/no-ref frames; our legacy fallback pointed them at the
+ * current output buffer. Individually this did not fix the coin-flip, but it is
+ * a genuine MPP-faithful, resolution-general behaviour and per the "many levers"
+ * paradigm it stays ON so it composes with future fixes rather than being
+ * reverted. Set 0 for the legacy fallback. */
+static int av1_no_fallback_ref = 1;
+module_param(av1_no_fallback_ref, int, 0644);
+MODULE_PARM_DESC(av1_no_fallback_ref, "Skip programming invalid/absent references (MPP-faithful, default ON; 0=legacy fallback to current buffer)");
+
+/* 2026-06-27: log the synthesised stream framing fed to HW (vs MPP stream_in.dat).
+ * Declared before config_addr_regs which uses it. */
+static int av1_strm_dump;
+module_param(av1_strm_dump, int, 0644);
+MODULE_PARM_DESC(av1_strm_dump, "AV1 log first 32 bytes + framing of the stream fed to HW (0=off,1=on)");
+
+/* 2026-06-27: synthesise the SEQ_HDR OBU into the stream (MPP feeds TD+SEQ+FRAME;
+ * we historically fed TD+FRAME). Needs the raw seq OBU bytes — see use site. */
+static int av1_strm_seqhdr;
+module_param(av1_strm_seqhdr, int, 0644);
+MODULE_PARM_DESC(av1_strm_seqhdr, "Include the SEQ_HDR OBU in the synthesised stream like MPP (0=off,1=on)");
 
 /* 2026-06-10 — also zero reg31-63 (the gap our register-init loops skip but MPP's
  * full memset covers; reg32=BSP TIMEOUT_THRESHOLD lives here). Probe whether a stale
@@ -2454,21 +2531,35 @@ static void vdpu383_av1_config_addr_regs(
 			 * We don't synthesise a SeqHdr OBU — HW gets sequence info
 			 * via the GBL header (reg131). */
 			u32 v = strm_len;
-			u32 leb_n = 0;
 			u32 prefix_n;
+			u32 p = 0;
+			/* f0.ivf SEQ_HDR OBU (0x0a type1 + 0x0b size11 + 11 body
+			 * bytes), taken raw from the clip — TEST of whether the HW
+			 * needs the in-stream SEQ_HDR (MPP feeds TD+SEQ+FRAME, we
+			 * historically fed TD+FRAME). Clip-specific; if it fixes the
+			 * decode, reconstruct the seq OBU from the V4L2 control. */
+			static const u8 av1_f0_seqobu[13] = {
+				0x0a, 0x0b, 0x00, 0x00, 0x00, 0x04, 0x45, 0x7e,
+				0x3e, 0xff, 0xfc, 0xc0, 0x20,
+			};
 
-			scratch[0] = 0x12;	/* TD OBU header, has_size */
-			scratch[1] = 0x00;	/* TD body size = 0 */
-			scratch[2] = 0x32;	/* OBU_FRAME header, has_size */
+			scratch[p++] = 0x12;	/* TD OBU header, has_size */
+			scratch[p++] = 0x00;	/* TD body size = 0 */
+			if (av1_strm_seqhdr) {
+				memcpy(scratch + p, av1_f0_seqobu,
+				       sizeof(av1_f0_seqobu));
+				p += sizeof(av1_f0_seqobu);
+			}
+			scratch[p++] = 0x32;	/* OBU_FRAME header, has_size */
 			do {
 				u8 b = v & 0x7f;
 
 				v >>= 7;
 				if (v)
 					b |= 0x80;
-				scratch[3 + leb_n++] = b;
+				scratch[p++] = b;
 			} while (v);
-			prefix_n = 3 + leb_n;
+			prefix_n = p;
 			memcpy(scratch + prefix_n, src_cpu, strm_len);
 			memunmap(src_cpu);
 
@@ -2480,6 +2571,17 @@ static void vdpu383_av1_config_addr_regs(
 
 				memset(scratch + used, 0,
 				       av1_ctx->strm_scratch.size - used);
+			}
+
+			if (av1_strm_dump) {
+				u8 *q = scratch;
+
+				pr_info("av1 strm-dump: strm_len=%u prefix_n=%u first32=%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+					strm_len, prefix_n,
+					q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],
+					q[8],q[9],q[10],q[11],q[12],q[13],q[14],q[15],
+					q[16],q[17],q[18],q[19],q[20],q[21],q[22],q[23],
+					q[24],q[25],q[26],q[27],q[28],q[29],q[30],q[31]);
 			}
 
 			av1_w(sink, AV1R_STRM_START_BIT, 0);
@@ -2568,6 +2670,13 @@ static void vdpu383_av1_config_addr_regs(
 		ref_ts = fp->reference_frame_ts[slot];
 		if (ref_ts != 0 && av1_ctx->dpb[slot].valid) {
 			ref_dma = av1_ref_dma(ctx, dst_buf, ref_ts);
+		} else if (av1_no_fallback_ref) {
+			/* MPP-faithful: an absent reference stays all-zero in
+			 * the register file (base + payload + strides), so the
+			 * HW does not engage a (self-)reference read. The
+			 * base/payload regs were pre-zeroed above; the stride
+			 * regs (71-106) were pre-zeroed earlier. Just skip. */
+			continue;
 		} else {
 			ref_dma = vb2_dma_contig_plane_dma_addr(
 					&dst_buf->vb2_buf, 0);
@@ -2725,8 +2834,31 @@ static void vdpu383_av1_config_addr_regs(
 			av1_w(sink, off + 4, mpp_rcb[k][2]);
 		}
 	} else {
+	/* 2026-06-27 test: faithfully replicate MPP's AV1 RCB layout — exact
+	 * 352x288 per-region SIZES (from mpp_f0.desc) AND contiguous packing
+	 * (base[i+1] = base[i] + size[i]), anchored at our RCB buffer base (our
+	 * total buffer is larger than MPP's ~102KB so it fits without an
+	 * allocator change). Tests, against the ip_reset deterministic baseline,
+	 * whether the row-context regions (esp. slot4 INTRA_IN_ROW) need MPP's
+	 * exact size+offset to stop the SB1+ desync. If it works, port
+	 * vdpu383_av1d_rcb_calc properly (resolution-general). */
+	static const u32 mpp_rcb_sz_352x288[14] = {
+		576, 0, 2112, 2112, 1088, 1088, 21760,
+		21760, 15872, 35328, 192, 0, 0, 0,
+	};
+	dma_addr_t rcb0 = rkvdec_rcb_buf_dma_addr(ctx, 0);
+	u32 mpp_pack_off = 0;
+
 	for (i = 0; i < rkvdec_rcb_buf_count(ctx); i++) {
 		u32 off = AV1R_RCB_BASE + i * AV1R_RCB_SLOT_SIZE;
+		bool use_mpp = av1_rcb_mpp_sizes && i < 14;
+		u32 sz = use_mpp ? mpp_rcb_sz_352x288[i]
+				 : rkvdec_rcb_buf_size(ctx, i);
+		dma_addr_t slot_base = use_mpp ? (rcb0 + mpp_pack_off)
+					       : rkvdec_rcb_buf_dma_addr(ctx, i);
+
+		if (use_mpp)
+			mpp_pack_off += sz;	/* contiguous like MPP */
 
 		if (av1_iova_fault && i == 4) {
 			/* Cat 5.1: redirect the intra above-row RCB to an unmapped
@@ -2738,8 +2870,8 @@ static void vdpu383_av1_config_addr_regs(
 				rkvdec_rcb_buf_size(ctx, i));
 			continue;
 		}
-		av1_w(sink, off, lower_32_bits(rkvdec_rcb_buf_dma_addr(ctx, i)));
-		av1_w(sink, off + 4, rkvdec_rcb_buf_size(ctx, i));
+		av1_w(sink, off, lower_32_bits(slot_base));
+		av1_w(sink, off + 4, sz);
 	}
 	/* Session 26 part 2: zero RCB slots beyond our buffer count so HW
 	 * doesn't dereference stale IOVAs from a previous codec session.
@@ -2820,6 +2952,26 @@ static void rkvdec_vdpu383_av1_done(struct rkvdec_ctx *ctx,
 			fp->frame_type, fp->order_hint, cdf_slot, ncrc, ccrc,
 			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
 			p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+
+		/* av1_adapt_dump>=2: write the adapted CDF (noncoeff 6944 + coeff
+		 * qband 5664 = 12608 B, the same span MPP's cabac_cdf_out.dat
+		 * covers) to a file for first-divergence diff vs MPP. The used coeff
+		 * qband sits at offset 6944 (qband0 base for this frame). */
+		if (av1_adapt_dump >= 2) {
+			struct file *cf = filp_open("/root/our_cdf_out.bin",
+						    O_WRONLY | O_CREAT | O_TRUNC,
+						    0644);
+			if (!IS_ERR(cf)) {
+				loff_t pos = 0;
+
+				kernel_write(cf, p, AV1_NON_COEF_CDF_SIZE, &pos);
+				kernel_write(cf, p + AV1_NON_COEF_CDF_SIZE, 5664,
+					     &pos);
+				filp_close(cf, NULL);
+				pr_info("av1 adapt-dump: wrote /root/our_cdf_out.bin (%d B)\n",
+					AV1_NON_COEF_CDF_SIZE + 5664);
+			}
+		}
 	}
 
 	for (i = 0; i < AV1_NUM_REF_FRAMES; i++) {
@@ -2911,6 +3063,10 @@ MODULE_PARM_DESC(av1_cache_win, "AV1 faithful read-cache config in the cache win
 static int av1_dump_ctrls;
 module_param(av1_dump_ctrls, int, 0644);
 MODULE_PARM_DESC(av1_dump_ctrls, "AV1 capture per-frame V4L2 controls to /root/av1.ctrls (0=off,1=on) - link-client capture");
+
+static int av1_gbl_dump;
+module_param(av1_gbl_dump, int, 0644);
+MODULE_PARM_DESC(av1_gbl_dump, "AV1 dump the packed 672-byte GBL header to /root/our_gbl.bin for diff vs MPP global_cfg.dat (0=off,1=on)");
 
 /*
  * 2026-06-08 Nicolas (lore) follow-up, applied to AV1: dump the intra-above-row
@@ -3144,6 +3300,10 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 				break;
 			udelay(1);
 		}
+		/* 2026-06-27: tested adding MPP's ip_reset_mask (0x8000000) status-
+		 * clear here to match rkvdec_vdpu383_reset exactly — it made the
+		 * decode LESS deterministic (3/5 varying vs 4/5), so it is NOT a
+		 * faithful improvement in our context; left out. */
 		writel(0xffff0000u, lb + info->irq_base);
 		writel(0xffff0000u, lb + info->status_base);
 		writel(info->ip_en_val, lb + info->ip_en_base);
@@ -3168,6 +3328,23 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 
 	/* Pack GBL buffer (Task 8). */
 	vdpu383_av1_config_global_hdr(ctx, seq, fp, fg, av1_ctx, tge, num_tge);
+
+	/* 2026-06-27 GBL-vs-symbol-decode diff: dump the packed 672-byte GBL
+	 * header (the frame-header config the HW symbol decoder consumes) for a
+	 * byte/bit diff vs MPP's golden global_cfg.dat. Gated av1_gbl_dump. */
+	if (av1_gbl_dump) {
+		struct file *gf = filp_open("/root/our_gbl.bin",
+					    O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (!IS_ERR(gf)) {
+			loff_t pos = 0;
+
+			kernel_write(gf,
+				     av1_ctx->gbl_buf[av1_ctx->cur_link_slot].cpu,
+				     672, &pos);
+			filp_close(gf, NULL);
+			pr_info("av1 gbl-dump: wrote /root/our_gbl.bin (672 B)\n");
+		}
+	}
 
 	/* Write address and stride registers (Task 9).
 	 *
@@ -3404,8 +3581,19 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 	else
 		writel(VDPU383_INT_EN_IRQ | (VDPU383_INT_EN_IRQ << 16),
 		       rkvdec->link + VDPU383_LINK_INT_EN);
+	if (av1_mmio_trace)
+		pr_info("LINK write off:%04x val:0x%08x (INT_EN)\n",
+			VDPU383_LINK_INT_EN,
+			av1_no_irq ? 0xffff0000u :
+			(VDPU383_INT_EN_IRQ | (VDPU383_INT_EN_IRQ << 16)));
 	writel(VDPU383_TIMEOUT_4K,  rkvdec->link + VDPU383_LINK_TIMEOUT_THRESHOLD);
 	writel(VDPU383_IP_CRU_MODE, rkvdec->link + VDPU383_LINK_IP_ENABLE);
+	if (av1_mmio_trace) {
+		pr_info("LINK write off:%04x val:0x%08x (TIMEOUT_THRESHOLD)\n",
+			VDPU383_LINK_TIMEOUT_THRESHOLD, VDPU383_TIMEOUT_4K);
+		pr_info("LINK write off:%04x val:0x%08x (IP_ENABLE)\n",
+			VDPU383_LINK_IP_ENABLE, VDPU383_IP_CRU_MODE);
+	}
 
 	/* 2026-06-09 N3 (sequence-diff): the VP9 kick drains posted writes with
 	 * wmb()+reg15 readback before DEC_E; the AV1 path didn't. On weakly-ordered
@@ -3416,6 +3604,9 @@ static int rkvdec_vdpu383_av1_run(struct rkvdec_ctx *ctx)
 		readl(rkvdec->regs + VDPU383_OFFSET_COMMON_REGS + 7 * 4);
 	}
 
+	if (av1_mmio_trace)
+		pr_info("LINK write off:%04x val:0x%08x (DEC_E/KICK)\n",
+			VDPU383_LINK_DEC_ENABLE, VDPU383_DEC_E_BIT);
 	writel(VDPU383_DEC_E_BIT,   rkvdec->link + VDPU383_LINK_DEC_ENABLE);
 
 	return 0;

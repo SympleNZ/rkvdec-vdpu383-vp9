@@ -3439,6 +3439,10 @@ static int rkvdec_vdpu383_vp9_run(struct rkvdec_ctx *ctx)
 	}
 
 	if (vp9_dump_ctrls)
+		pr_info("vp9-feat f=%u flags=0x%03x interp=%u refmode=%u\n",
+			ctx->dev->accum_frames_run, fp->flags,
+			fp->interpolation_filter, fp->reference_mode);
+	if (vp9_dump_ctrls)
 		pr_info("vp9-addr f=%u flags=0x%03x decout=%08x colmv_cur=%08x payload_cur=%08x segid_cur=%08x updprob=%08x last=%08x gold=%08x alt=%08x\n",
 			ctx->dev->accum_frames_run, fp->flags,
 			vp9_ctx->regs.vp9_addr.reg168_decout_base,
@@ -4027,10 +4031,10 @@ static int rkvdec_vdpu383_vp9_run(struct rkvdec_ctx *ctx)
 	/* 2026-06-26: full reg-file readback (reg0-211) for byte-diff vs MPP
 	 * regs_full.dat. Read-only, immediately before the kick. */
 	if (unlikely(vp9_regdump)) {
-		static u32 vp9_regbuf[212];
+		static u32 vp9_regbuf[256];
 		int r;
 
-		for (r = 0; r < 212; r++)
+		for (r = 0; r < 256; r++)
 			vp9_regbuf[r] = readl(rkvdec->regs + r * 4);
 		print_hex_dump(KERN_INFO, "VP9REGDUMP ", DUMP_PREFIX_OFFSET,
 			       32, 4, vp9_regbuf, sizeof(vp9_regbuf), false);

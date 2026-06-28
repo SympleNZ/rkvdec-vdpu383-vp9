@@ -35,6 +35,25 @@ int link_trace;
 module_param(link_trace, int, 0644);
 MODULE_PARM_DESC(link_trace, "Trace LINK bootstrap vs APPEND per enqueue (0=off,1=on)");
 
+/* 2026-06-27: MPP-faithful per-task IOMMU TLB flush in the link enqueue.
+ * Same-board enqueue diff vs MPP-on-mainline (RUNTIME_TRACE_RESULT_2026-06-27)
+ * found MPP calls mpp_iommu_flush_tlb() (en_sw_iommu_zap, true for vdpu383)
+ * before the final CFG_DONE, every task; our link path set the flag but never
+ * flushed. A stale IOVA->phys entry makes the HW link engine DMA-read stale
+ * pages from the descriptor itself -> run-to-run-varying (coin-flip) decode.
+ * Default ON (only fires when info->en_sw_iommu_zap); set 1 to disable for
+ * A/B. */
+static int link_no_tlb_flush;
+module_param(link_no_tlb_flush, int, 0644);
+MODULE_PARM_DESC(link_no_tlb_flush, "Disable the MPP-faithful per-task IOMMU TLB flush in link enqueue (0=flush/default, 1=skip)");
+
+/* 2026-06-27: flat per-slot descriptor dump (matches MPP's "tb[%03d]" format,
+ * prefix "ourdesc") so the built link descriptor byte-diffs against MPP-on-
+ * mainline's mpp_f0.desc. Default off. */
+static int link_desc_dump;
+module_param(link_desc_dump, int, 0644);
+MODULE_PARM_DESC(link_desc_dump, "Dump the filled link descriptor (flat tb[000..N]) for diff vs MPP (0=off,1=on)");
+
 /* ---- BSP cache offsets (mpp_rkvdec2.h:82-88) -------------------- */
 #define RKVDEC_BSP_CACHE0_SIZE	0x51c
 #define RKVDEC_BSP_CACHE1_SIZE	0x55c
@@ -302,6 +321,17 @@ void rkvdec_link_fill_descriptor(struct rkvdec_link_table *table, u32 slot,
 					   table->node_size,
 					   DMA_TO_DEVICE);
 	}
+
+	if (link_desc_dump) {
+		dma_addr_t slot_iova = table->iova +
+				       (dma_addr_t)slot * table->node_size;
+		u32 k;
+
+		pr_info("ourdesc iova=%08x tb_reg_num=%d\n",
+			(u32)slot_iova, info->tb_reg_num);
+		for (k = 0; k < info->tb_reg_num; k++)
+			pr_info("ourdesc tb[%03d] 0x%08x\n", k, node[k]);
+	}
 }
 
 u32 rkvdec_link_read_task_status(struct rkvdec_link_table *table, u32 slot)
@@ -504,6 +534,17 @@ int rkvdec_link_enqueue_vdpu383(struct rkvdec_link_table *table, u32 slot,
 			       link_base + info->ip_en_base);
 
 	wmb();
+
+	/* MPP-faithful per-task IOMMU TLB flush (BSP rkvdec2_link_enqueue does
+	 * this here, gated by en_sw_iommu_zap, before the final CFG_DONE). The
+	 * HW link engine DMA-reads the descriptor + all buffers through the
+	 * decoder IOMMU; a stale TLB entry corrupts that read. See param. */
+	if (info->en_sw_iommu_zap && !link_no_tlb_flush) {
+		struct iommu_domain *dom = iommu_get_domain_for_dev(table->dev);
+
+		if (dom)
+			iommu_flush_iotlb_all(dom);
+	}
 
 	/*
 	 * R47 (2026-06-01) — LINK_MODE_BASELINE hypothesis #4:

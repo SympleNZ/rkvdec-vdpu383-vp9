@@ -1,3 +1,9 @@
+> **NOTE (2026-06-28): the "reference-bypass" framing in this document is SUPERSEDED.**
+> The complex-content failure was definitively isolated to VP9 **compound prediction** and proven
+> to be an internal compound-MC issue below every V4L2-touchable interface (driver-addressable in
+> principle, not silicon-broken, but not fixable through mainline V4L2). See the README "VP9 compound
+> prediction" section for the final, authoritative conclusion. This file is retained as investigation history.
+
 # The VP9 small-footprint reference-bypass bug (VDPU383, mainline-V4L2 stack)
 
 This is the one outstanding correctness bug and the reason this repo is published

@@ -68,7 +68,7 @@ Notes:
 
 ```sh
 python3 fluster.py run -d GStreamer-VP9-V4L2SL -ts VP9-TEST-VECTORS -j1
-# Current: 148/305 strict-MD5. See CONFORMANCE.md for the per-cluster breakdown
+# Current: 107/305 strict-MD5. See CONFORMANCE.md for the per-cluster breakdown
 # (the bulk of the misses are the reference-bypass bug — small-footprint inter
 #  frames, REF_BYPASS_BUG.md — plus downstream gst/comparator).
 ```

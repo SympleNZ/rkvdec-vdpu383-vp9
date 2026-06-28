@@ -151,6 +151,44 @@ module_param(warmup_off, int, 0644);
 MODULE_PARM_DESC(warmup_off, "A/B: disable RK3576 warmup entirely (probe+resume) (0=on/default,1=off)");
 
 /*
+ * 2026-06-27 — link-engine PRIME at probe (the non-warmup init-time prime).
+ * rwmmio trace of MPP's rkvdec2_probe (.103, unbind/rebind) shows it cycles the
+ * link engine through enable->configure->disable ONCE at probe (via
+ * rkvdec2_link_init): writes 0x8000/0x7ffff/0x10001/<base>/1/1/1/IRQmasks then
+ * zeroes 000/008/018/058. Our single-shot probe ioremaps the link window but
+ * never primes the engine, so its internal state machine is left undefined at
+ * module-load — the suspected seed of the AV1 metastable "set at init, not the
+ * warmup" attractor. This replicates MPP's probe prime exactly. Default off. */
+int link_prime;
+module_param(link_prime, int, 0644);
+MODULE_PARM_DESC(link_prime, "Run MPP's probe-time link-engine enable/configure/disable prime (0=off,1=on)");
+
+/*
+ * 2026-06-27 — HEVC read-cache config (throughput). Our AV1 and VP9 backends
+ * configure the VDPU383 read caches (CACHE0/1/2 = 0x13 CACHEABLE|READ_ALLOC|
+ * LINE_64, + CLR + MAX_READS=0x1c); MPP writes the same for HEVC (rwmmio trace
+ * .103: 0x13 to f61c/f65c/f69c). Our HEVC backend never configured them, so
+ * HEVC decodes with the read caches OFF — ~4x more DRAM traffic and ~4x slower
+ * pure-HW decode (4.6 ms vs MPP 1.15 ms for 1080p) DESPITE our DDR being faster.
+ * Default off for the A/B; promote to default if it closes the gap. */
+int hevc_cache = 1;
+module_param(hevc_cache, int, 0644);
+MODULE_PARM_DESC(hevc_cache, "Configure VDPU383 read caches on the mainline HEVC + H.264 paths (1=on, the ~5x throughput fix; 0=off for A/B)");
+
+/*
+ * FULL_PATH_RETRACE suspect #3 — BSP asserts explicit decoder clock RATES that
+ * mainline never sets (we only clk_bulk_enable, inheriting power-up rates:
+ * core=594 cabac=high hevc_cabac=1000 aclk=594 MHz). BSP sets aclk=300 core=200
+ * cabac=200 hevc_cabac=300 MHz (bsp mpp_rkvdec2.c:1007-1010). Different rates AND
+ * different inter-domain ratios — invisible to a per-frame register diff but it
+ * changes recon/CABAC pipeline timing. Default 0 = inherit (unchanged). 1 = pin
+ * BSP rates. Bulk .id order from DT clock-names: axi ahb cabac core hevc_cabac.
+ */
+int bsp_clk_rates;
+module_param(bsp_clk_rates, int, 0644);
+MODULE_PARM_DESC(bsp_clk_rates, "Pin BSP decoder clock rates aclk=300 core=200 cabac=200 hevc_cabac=300 MHz (0=inherit power-up rates, 1=assert BSP rates)");
+
+/*
  * 2026-06-08 Variant B — IRQ-driven warmup (Nicolas's lore suggestion). When 1,
  * the warmup arms the link IRQ and sleeps on a completion (reaped by
  * rkvdec_irq_top) instead of busy-polling reg 0x4c. Default 0 = the validated
@@ -4310,6 +4348,35 @@ static int rkvdec_probe(struct platform_device *pdev)
 	rkvdec->num_clocks = ret;
 	rkvdec->axi_clk = devm_clk_get(&pdev->dev, "axi");
 
+	/* FULL_PATH_RETRACE suspect #3: optionally pin BSP decoder clock rates. */
+	if (bsp_clk_rates) {
+		int ci;
+
+		for (ci = 0; ci < rkvdec->num_clocks; ci++) {
+			const char *id = rkvdec->clocks[ci].id;
+			struct clk *c = rkvdec->clocks[ci].clk;
+			unsigned long want = 0;
+
+			if (!id || !c)
+				continue;
+			if (!strcmp(id, "axi"))
+				want = 300000000;
+			else if (!strcmp(id, "core"))
+				want = 200000000;
+			else if (!strcmp(id, "cabac"))
+				want = 200000000;
+			else if (!strcmp(id, "hevc_cabac"))
+				want = 300000000;
+			if (want) {
+				int rr = clk_set_rate(c, want);
+
+				dev_info(&pdev->dev,
+					 "bsp_clk_rates: %s -> %lu Hz (set_rate ret %d, now %lu)\n",
+					 id, want, rr, clk_get_rate(c));
+			}
+		}
+	}
+
 	/* CRU reset lines (optional; used only when rkvdec_cru_reset is set). */
 	rkvdec->resets[0].id = "axi";
 	rkvdec->resets[1].id = "ahb";
@@ -4462,6 +4529,30 @@ static int rkvdec_probe(struct platform_device *pdev)
 			pm_runtime_put_autosuspend(&pdev->dev);
 			ret = 0;
 			goto warmup_skip;
+		}
+
+		/* 2026-06-27: MPP's probe-time link-engine prime (rkvdec2_link_init).
+		 * Cycle the engine enable->configure->disable to latch a known
+		 * internal state, exactly as the .103 rwmmio trace shows. */
+		if (link_prime) {
+			void __iomem *l = rkvdec->link;
+
+			writel(0x8000u,     l + 0x058);
+			writel(0x7ffffu,    l + 0x054);
+			writel(0x10001u,    l + 0x000);
+			writel(0xfffff000u, l + 0x004);
+			writel(0x1u,        l + 0x008);
+			writel(0x1u,        l + 0x018);
+			writel(0x1u,        l + 0x00c);
+			writel(0xffff0000u, l + 0x048);
+			writel(0xffff0000u, l + 0x04c);
+			wmb();
+			writel(0x0u,        l + 0x000);
+			writel(0x0u,        l + 0x008);
+			writel(0x0u,        l + 0x018);
+			writel(0x0u,        l + 0x058);
+			wmb();
+			dev_info(&pdev->dev, "rkvdec: link-engine prime applied\n");
 		}
 
 		rc = warmup_irq ?

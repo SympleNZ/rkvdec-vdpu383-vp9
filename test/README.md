@@ -18,7 +18,7 @@ libvpx reference with strict MD5:
 python3 fluster.py run -d GStreamer-VP9-V4L2SL -ts VP9-TEST-VECTORS -j1
 ```
 
-Current baseline: **148/305** (`docs/fluster_baseline.csv`). See
+Current baseline: **107/305** (`docs/fluster_baseline.csv`). See
 `docs/CONFORMANCE.md` for the per-cluster breakdown — the misses are dominated by
 the reference-bypass bug (`docs/REF_BYPASS_BUG.md`) and downstream gst/comparator
 issues, not core decode. **Reboot before a fresh baseline** (state bleeds across runs).
