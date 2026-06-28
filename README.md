@@ -32,7 +32,7 @@ conclusion independently.
 | 8-bit Profile 0 — INTER, single-reference, low-motion | ✅ bit-exact to libvpx / MPP; visually perfect on HDMI |
 | 8-bit Profile 0 — **compound / SELECT** (alt-ref, high-motion) | ❌ **the open gap** — wrong on a content-specific subset of compound frames |
 | 10-bit Profile 2 (4:2:0) | ✅ correct (±1 reconstruction rounding at 10-bit); HDR10+ displays correctly |
-| Resolutions 720p / 1080p / 4K | ✅ all decode, well above real-time on clean content |
+| Resolutions 720p / 1080p / 4K | ✅ all decode; 720p/1080p well above real-time, 4K ~32 fps pure-HW (marginal real-time) |
 | Mid-stream resolution change | ⚠️ driver signals it correctly; gst-plugins-bad drops frames (downstream) |
 | Profile 3 (4:2:2 / 4:4:4), 12-bit | ❌ unsupported by design |
 
@@ -78,7 +78,7 @@ The implementation milestones behind that result:
 **10-bit Profile 2 (4:2:0).** Decodes correctly. Output is the Rockchip packed
 10-bit layout `V4L2_PIX_FMT_NV15` (= gst `NV12_10LE40`), consistent with the
 HEVC/H.264 paths on this IP. Versus libvpx it is **85% of samples bit-exact, the
-rest off by exactly +1 (max delta 4)** — a reconstruction-rounding difference
+rest off by +1 (max delta 4)** — a reconstruction-rounding difference
 exposed at 10-bit precision, not a decode defect (8-bit rounds it away and is
 bit-exact). HDR10+ sample content displays correctly on HDMI.
 
@@ -87,13 +87,16 @@ time on clean content (performance governor):
 
 | resolution | pure-HW per frame | pure-HW fps |
 |---|---|---|
-| 720p | 1.9 ms | ~517 |
-| 1080p | 4.3 ms | ~231 |
-| 4K (2160p) | ~16–19 ms | ~52–60 |
+| 720p | ~4.2 ms | ~240 |
+| 1080p | ~4.8 ms | ~205 |
+| 4K (2160p) | ~31 ms | ~32 |
 
-i.e. multiples of real-time at 720p/1080p and real-time at 4K30. The vendor MPP/BSP
-stack is ~2.3–3× faster (it pipelines via continuous link mode; this driver uses
-per-frame single-shot submit by default). See
+Small frames are fixed-cost / overhead-bound (720p ≈ 1080p); 4K is
+memory-bandwidth-bound. So: comfortably above real-time at 720p/1080p, and ~32 fps
+pure-HW at 4K — marginal for real-time 4K playback once pipeline overhead is added
+(numbers are content-dependent; measured on a crf31 clip, performance governor). The
+vendor MPP/BSP stack is ~3× faster at 4K (it pipelines via continuous link mode;
+this driver uses per-frame single-shot submit by default). See
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) for the native baseline and the
 `flush-only-after-restore` IOMMU optimisation.
 
