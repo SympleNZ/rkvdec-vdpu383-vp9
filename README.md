@@ -320,7 +320,9 @@ parameters and gotchas.
 Native mainline V4L2 VP9 on RK3576 / VDPU383 is **correct and shippable for
 KEY / single-reference / low-motion 8-bit content**. **Compound / high-motion
 content** (alt-ref, some YouTube VP9) should be routed to the **vendor MPP
-decoder** (BSP, or the out-of-tree `rk_vcodec` on mainline — both bit-exact here)
+decoder** (BSP, or the out-of-tree `rk_vcodec` on mainline — both bit-exact here;
+the mainline build is published:
+[`rkvdec-vdpu383-mpp-mainline`](https://github.com/SympleNZ/rkvdec-vdpu383-mpp-mainline))
 or to an **H.264 / HLS** path. No native-V4L2 path exists for VP9 compound on this
 silicon today. This is symmetric with the AV1 result for the same IP.
 
