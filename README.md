@@ -358,6 +358,12 @@ from the investigation; all default off.)
 GPL-2.0 (Linux kernel module). Derived from and built on the mainline Rockchip
 `rkvdec` driver.
 
+## Related
+
+- [`rkvdec-vdpu383-av1`](https://github.com/SympleNZ/rkvdec-vdpu383-av1) — the sibling V4L2 AV1 driver (symmetric conclusion).
+- [`rkvdec-vdpu383-mpp-mainline`](https://github.com/SympleNZ/rkvdec-vdpu383-mpp-mainline) — vendor MPP on a mainline kernel; the same-silicon proof harness.
+- [`rkvdec-vdpu383-h264-hevc`](https://github.com/SympleNZ/rkvdec-vdpu383-h264-hevc) — the mainline HEVC/H.264 read-cache throughput fix (7× / 2.4×), which ships in this driver's `src/`.
+
 ## Acknowledgements
 
 Built on Collabora's mainline VDPU383 H.264/H.265 `rkvdec` work, on the VP9 V4L2
