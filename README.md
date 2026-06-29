@@ -216,9 +216,22 @@ two-reference averaging HW is sound, and f11's entropy and modes are provably
 correct. What remains is an **interior, motion-localised, content-dependent error
 in the VDPU383's internal VP9-compound motion-compensation path** — a spec-distinct
 HW path from HEVC's weighted bi-pred, with **every control register byte-identical
-to MPP**, so there is no precision/mode register left to change. It is fixed in
-silicon, below every interface the mainline V4L2 driver controls. This is symmetric
-with the AV1 result for the same silicon.
+to MPP**, so there is no precision/mode register left to change. It is below every
+interface the mainline V4L2 driver controls — HW-internal state, driver-addressable
+in principle (the silicon is capable: MPP-on-mainline decodes VP9 INTER bit-exact)
+but not reachable from software here. This is symmetric with the AV1 result for the
+same silicon.
+
+On that shared silicon, the AV1 side closed this from two further directions that
+apply to the whole IP. A **graft** ran MPP's *actual compiled back-end*
+(`mpp_rkvdec2_link`) under the V4L2 front-end and it **still produced the wrong
+output** — excluding the back-end, the buffer allocation and the register image. A
+line-for-line **`mpp_service`-boundary** source diff then found the one interface
+both stacks share to be **functionally identical** (one session per stream, shared
+worker, device held resumed) with **no process-context binding** — no `mm`,
+fd-table, PASID or per-process IOMMU domain (falsified in source). Four independent
+terminals now place the residual in the VDPU383's HW-internal state, not in any
+software-visible operation.
 
 ### The ask
 

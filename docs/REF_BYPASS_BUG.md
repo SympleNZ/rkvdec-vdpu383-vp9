@@ -274,3 +274,19 @@ VDPU383 require for VP9 (and AV1) INTER decode that H.264 and HEVC do not — gi
 programmable input, the stream bytes, the submission sequence, the continuously-armed ring, *and*
 the full clock/IOMMU/PM/warmup operation set are replicated from MPP, the decode *starts* correct,
 yet diverges mid-frame while MPP (same silicon) is bit-exact?
+
+**(f) 2026-06-29 — closed from two further directions (cross-codec, applies to this IP).** Run on the
+deterministic AV1 repro but excluding the same shared infrastructure VP9 uses:
+
+- **The graft** ran MPP's *actual compiled* `mpp_rkvdec2_link` back-end under the V4L2 front-end and
+  **still produced the wrong attractor** — excluding the back-end, MPP's internal buffers and the
+  register image (`GRAFT_TERMINAL_2026-06-29.md`).
+- **The `mpp_service`-boundary source diff** found the one interface both stacks share **functionally
+  identical** (one session per stream, shared worker, device held resumed) and carrying **no process
+  context** (`current->`/`tgid`/`mm`/PASID/per-process IOMMU domain all absent in source) — the
+  process-context hypothesis is **falsified in source** (`MPP_SERVICE_BOUNDARY_RESULT_2026-06-29.md`).
+
+The residual is now excluded from **four independent directions** (decode-op matching; MPP→ours reverse
+bisection; the graft; the boundary diff) and is HW-internal entropy/symbol-decoder state — measurable as
+the `cabac_cdf_out` ~68% divergence (byte-identical input CDF). The maintainer-grade package is
+`VDPU383_ENTROPY_RESIDUAL_EVIDENCE_BRIEF_2026-06-29.md`.
