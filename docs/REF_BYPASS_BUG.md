@@ -287,6 +287,14 @@ deterministic AV1 repro but excluding the same shared infrastructure VP9 uses:
   process-context hypothesis is **falsified in source** (`MPP_SERVICE_BOUNDARY_RESULT_2026-06-29.md`).
 
 The residual is now excluded from **four independent directions** (decode-op matching; MPP→ours reverse
-bisection; the graft; the boundary diff) and is HW-internal entropy/symbol-decoder state — measurable as
-the `cabac_cdf_out` ~68% divergence (byte-identical input CDF). The maintainer-grade package is
-`VDPU383_ENTROPY_RESIDUAL_EVIDENCE_BRIEF_2026-06-29.md`.
+bisection; the graft; the boundary diff) and is HW-internal.
+
+**(g) 2026-06-30 final cut — MPP's golden output.** A fifth comparison captured MPP's **correct** output
+via libmpp's own dump path and byte-diffed it against ours on the deterministic `cplx720` frame 10: our
+output is byte-identical to the previous (static) reference frame, differing from MPP's compound-predicted
+frame from pixel 0 — a **whole-frame substitution** ("stuck-on-reference"), the clearest form of the
+internal-MC fault, with entropy and register state matching MPP. The AV1 sibling shows the *identical*
+frame-stuck signature on inter frames (its CDF path likewise matching MPP). The deterministic defect is
+unified across both codecs as a **motion-compensation / prediction fault** below the interface — confirmed
+against MPP's golden output. (The "entropy" phrasing applies to AV1's niche metastable-intra case; this
+deterministic compound bug is motion-compensation.)

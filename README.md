@@ -233,6 +233,18 @@ fd-table, PASID or per-process IOMMU domain (falsified in source). Four independ
 terminals now place the residual in the VDPU383's HW-internal state, not in any
 software-visible operation.
 
+A fifth and final cut captured MPP's **correct, golden** output (via libmpp's own
+dump path) and byte-diffed it against ours on a deterministic compound frame
+(`cplx720` frame 10). The result is the clearest possible form of this bug: a
+**whole-frame substitution** — our output is byte-identical to the *previous*
+(static) reference frame, differing from MPP's compound-predicted frame from pixel
+0. The decoder emitted a reference buffer unchanged instead of running compound
+prediction — a "**stuck-on-reference**" motion-compensation fault, with the entropy
+and register state matching MPP. The AV1 sibling shows the *identical* frame-stuck
+signature on inter frames (with its CDF path likewise matching MPP), unifying the
+deterministic defect across both codecs as a motion-compensation/prediction fault,
+below the interface — confirmed against MPP's golden output.
+
 ### The ask
 
 Every programmable input is byte-identical to MPP; the GBL header and compound
