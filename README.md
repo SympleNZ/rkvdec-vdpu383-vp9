@@ -1,9 +1,10 @@
 # rkvdec-vdpu383-vp9 — V4L2 stateless VP9 decoder for Rockchip RK3576 (VDPU383)
 
-The **first working mainline-Linux V4L2 stateless VP9 decoder** for the Rockchip
-**RK3576** SoC's **VDPU383** video IP. It is **production-ready and bit-exact to
-the vendor MPP decoder for KEY / single-reference / low-motion 8-bit content**,
-built on top of the now-mainline VDPU383 H.264/H.265 `rkvdec` infrastructure.
+A working mainline-Linux **V4L2 stateless VP9 decoder** for the Rockchip
+**RK3576** SoC's **VDPU383** video IP, built on top of the now-mainline VDPU383
+H.264/H.265 `rkvdec` infrastructure. For KEY / single-reference / low-motion 8-bit
+content it is **bit-exact to the vendor MPP decoder** and has held up across
+conformance and real-content testing. VP9 for the VDPU383 is not yet in mainline.
 
 One correctness gap remains, and this repository documents it to its absolute
 conclusion: **VP9 compound prediction** (`reference_mode = SELECT`, the
@@ -29,7 +30,7 @@ conclusion independently.
 | Capability | State |
 |---|---|
 | 8-bit Profile 0 — intra / KEY | ✅ bit-exact to libvpx / MPP |
-| 8-bit Profile 0 — INTER, single-reference, low-motion | ✅ bit-exact to libvpx / MPP; visually perfect on HDMI |
+| 8-bit Profile 0 — INTER, single-reference, low-motion | ✅ bit-exact to libvpx / MPP; displays correctly on HDMI |
 | 8-bit Profile 0 — **compound / SELECT** (alt-ref, high-motion) | ❌ **the open gap** — wrong on a content-specific subset of compound frames |
 | 10-bit Profile 2 (4:2:0) | ✅ correct (±1 reconstruction rounding at 10-bit); HDR10+ displays correctly |
 | Resolutions 720p / 1080p / 4K | ✅ all decode; 720p/1080p well above real-time, 4K ~32 fps pure-HW (marginal real-time) |
@@ -52,7 +53,7 @@ VP9) must be routed elsewhere (see [Disposition](#disposition)).
 **8-bit Profile 0 — bit-exact for KEY / single-ref / low-motion.** KEY/intra and
 single-reference inter frames decode **bit-exact to libvpx and to the vendor MPP
 decoder** on real-world content. Validated three ways: visually on HDMI
-(large-frame clips such as `earth_1080p` and a GoPro promo display perfectly); by
+(large-frame clips such as `earth_1080p` and a GoPro promo display correctly); by
 Fluster strict-MD5 (the core / quantizer / intra / superframe classes pass); and
 by a controlled A/B on real YouTube content — a single-pass (single-reference)
 re-encode of GoPro 720p footage decodes **119/120 frames bit-exact** to its
@@ -342,8 +343,8 @@ parameters and gotchas.
 
 ## Disposition
 
-Native mainline V4L2 VP9 on RK3576 / VDPU383 is **correct and shippable for
-KEY / single-reference / low-motion 8-bit content**. **Compound / high-motion
+Native mainline V4L2 VP9 on RK3576 / VDPU383 is **correct and usable for
+KEY / single-reference / low-motion 8-bit content** (bit-exact to MPP). **Compound / high-motion
 content** (alt-ref, some YouTube VP9) should be routed to the **vendor MPP
 decoder** (BSP, or the out-of-tree `rk_vcodec` on mainline — both bit-exact here;
 the mainline build is published:
